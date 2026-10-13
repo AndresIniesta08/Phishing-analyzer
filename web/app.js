@@ -1,0 +1,1112 @@
+const emailInput = document.querySelector("#email-input");
+const subjectInput = document.querySelector("#email-subject");
+const fromInput = document.querySelector("#email-from");
+const toInput = document.querySelector("#email-to");
+const replyToInput = document.querySelector("#email-reply-to");
+const fileInput = document.querySelector("#email-file");
+const fileName = document.querySelector("#file-name");
+const previewButton = document.querySelector("#preview-button");
+const analyzeButton = document.querySelector("#analyze-button");
+const errorMessage = document.querySelector("#error-message");
+const previewCard = document.querySelector("#preview-card");
+const resultCard = document.querySelector("#result-card");
+
+let previewedInput = null;
+let currentReportId = null;
+let csrfToken = null;
+let currentUser = null;
+let incidentReportIds = new Set();
+
+function getEmailInput() {
+  return {
+    email: emailInput.value,
+    subject: subjectInput.value.trim(),
+    from: fromInput.value.trim(),
+    to: toInput.value.trim(),
+    reply_to: replyToInput.value.trim(),
+  };
+}
+
+for (const link of document.querySelectorAll(".nav-link")) {
+  link.addEventListener("click", () => {
+    for (const item of document.querySelectorAll(".nav-link")) {
+      item.classList.toggle("is-active", item === link);
+      if (item === link) item.setAttribute("aria-current", "page");
+      else item.removeAttribute("aria-current");
+    }
+  });
+}
+
+const recommendations = {
+  sender: "Verify the sender and request using a known, independent contact method.",
+  content: "Do not provide credentials or approve unusual requests; verify through a trusted channel.",
+  urls: "Do not open the link. Use approved security tools or report it to your security team.",
+  attachments: "Do not open or execute the attachment. Request an approved security scan.",
+};
+
+function showError(message) {
+  errorMessage.textContent = message;
+  errorMessage.hidden = false;
+}
+
+function clearError() {
+  errorMessage.textContent = "";
+  errorMessage.hidden = true;
+}
+
+function addField(container, label, value) {
+  const term = document.createElement("dt");
+  term.textContent = label;
+  const description = document.createElement("dd");
+  description.textContent = value || "Not present";
+  container.append(term, description);
+}
+
+function formatAddresses(addresses) {
+  return addresses.map((item) => item.name ? `${item.name} <${item.address}>` : item.address).join(", ");
+}
+
+function renderPreview(data) {
+  const fields = document.querySelector("#email-fields");
+  fields.replaceChildren();
+  addField(fields, "From", formatAddresses(data.sender));
+  addField(fields, "To", formatAddresses(data.recipients));
+  addField(fields, "Reply-To", formatAddresses(data.reply_to));
+  addField(fields, "Return-Path", data.return_path);
+  addField(fields, "Subject", data.subject);
+
+  const auth = document.querySelector("#auth-preview");
+  auth.replaceChildren();
+  for (const check of data.authentication) {
+    const item = document.createElement("li");
+    item.textContent = `${check.name}: ${check.status}`;
+    const note = document.createElement("span");
+    note.className = "subtle";
+    note.textContent = check.source;
+    item.append(note);
+    auth.append(item);
+  }
+
+  const links = document.querySelector("#links-preview");
+  links.replaceChildren();
+  if (data.urls.length === 0) {
+    const item = document.createElement("li");
+    item.textContent = "No links found in the extracted text.";
+    links.append(item);
+  }
+  for (const link of data.urls) {
+    const item = document.createElement("li");
+    item.textContent = `Destination: ${link.destination}`;
+    const label = document.createElement("span");
+    label.className = "subtle";
+    label.textContent = `Displayed as: ${link.displayed_as || "(not available)"} · ${link.reputation_status}`;
+    item.append(label);
+    links.append(item);
+  }
+
+  const attachments = document.querySelector("#attachments-preview");
+  attachments.replaceChildren();
+  if (data.attachments.length === 0) {
+    const item = document.createElement("li");
+    item.textContent = "No attachments detected.";
+    attachments.append(item);
+  }
+  for (const attachment of data.attachments) {
+    const item = document.createElement("li");
+    item.textContent = `${attachment.filename}${attachment.suspicious ? " · suspicious type" : ""}`;
+    const note = document.createElement("span");
+    note.className = "subtle";
+    note.textContent = `${attachment.content_type} · ${attachment.size_bytes} bytes · SHA-256 ${attachment.sha256} · ${attachment.scan_status}`;
+    item.append(note);
+    attachments.append(item);
+  }
+
+  document.querySelector("#body-preview").textContent = data.body || "(No plain-text or HTML body extracted.)";
+  previewCard.hidden = false;
+  document.querySelector("#analysis-guidance").hidden = true;
+  resultCard.hidden = true;
+  analyzeButton.disabled = false;
+}
+
+function renderCategories(data) {
+  const container = document.querySelector("#category-results");
+  container.replaceChildren();
+  const authStatus = (name) => data.authentication.find((item) => item.name === name).status;
+  const sections = [
+    {
+      key: "sender",
+      title: "Sender and authentication",
+      checks: [
+        `From: ${formatAddresses(data.sender) || "not present"}`,
+        `Recipients: ${formatAddresses(data.recipients) || "not present"}`,
+        `Reply-To: ${formatAddresses(data.reply_to) || "not present"}`,
+        `Return-Path: ${data.return_path || "not present"}`,
+        `SPF: ${authStatus("SPF")}`,
+        `DKIM: ${authStatus("DKIM")}`,
+        `DMARC: ${authStatus("DMARC")}`,
+      ],
+    },
+    { key: "content", title: "Content indicators", checks: ["Urgency, credentials, payment, and business-context text heuristics"] },
+    {
+      key: "urls",
+      title: "URLs",
+      checks: [
+        `${data.url_count} URL(s) extracted; reputation not checked`,
+        ...data.urls.map((url) => `${url.destination} · ${url.reputation_status}`),
+      ],
+    },
+    {
+      key: "attachments",
+      title: "Attachments",
+      checks: data.attachments.length
+        ? data.attachments.map((item) => `${item.filename} · ${item.content_type} · ${item.size_bytes} bytes · SHA-256 ${item.sha256} · ${item.scan_status}`)
+        : ["No attachments detected."],
+    },
+  ];
+
+  for (const section of sections) {
+    const card = document.createElement("article");
+    card.className = "category-card";
+    const heading = document.createElement("h3");
+    heading.textContent = section.title;
+    card.append(heading);
+    for (const check of section.checks) {
+      const item = document.createElement("span");
+      item.className = "check-pill";
+      item.textContent = check;
+      card.append(item);
+    }
+    const findings = data.findings.filter((finding) => finding.category === section.key);
+    if (findings.length) {
+      for (const finding of findings) {
+        const item = document.createElement("span");
+        item.className = finding.points > 0 ? "check-pill check-fail" : "check-pill";
+        item.textContent = finding.reason;
+        card.append(item);
+      }
+    }
+    container.append(card);
+  }
+}
+
+function renderResult(data) {
+  currentReportId = data.report_id || data.id;
+  const incidentButton = document.querySelector("#create-incident-button");
+  incidentButton.hidden = !["analyst", "admin"].includes(currentUser?.role);
+  incidentButton.disabled = incidentReportIds.has(currentReportId);
+  incidentButton.textContent = incidentButton.disabled ? "Incident already created" : "Create incident";
+  const level = String(data.level).toLowerCase();
+  const banner = document.querySelector("#risk-banner");
+  banner.className = `risk-banner risk-${level}`;
+  document.querySelector("#risk-level").textContent = `${data.level} RISK`;
+  document.querySelector("#risk-score").textContent = data.score;
+  const scoring = data.scoring;
+  document.querySelector("#scoring-explanation").textContent = scoring
+    ? `${scoring.indicator_points_total} indicator points across ${data.findings.filter((finding) => finding.points > 0).length} positive finding(s); displayed score ${data.score}/100${scoring.score_cap_applied ? " (capped at 100)" : ""}. ${scoring.method}`
+    : "The score combines configured rule points and is not a calibrated probability.";
+  document.querySelector("#confidence-explanation").textContent = data.confidence_note
+    || "Evidence quality describes how directly an indicator is supported; it is not a probability that the email is malicious.";
+  const language = data.language_analysis;
+  document.querySelector("#language-explanation").textContent = language
+    ? `Language rules: ${language.supported_languages.join(", ")}. Matched: ${language.matched_languages.length ? language.matched_languages.join(", ") : "no non-English phrase rules"}. ${language.method}`
+    : "Language detection is limited to the configured rule set.";
+  document.querySelector("#report-date").textContent =
+    `Report ${data.report_id || data.id || ""} · ${data.analyzed_at || ""}`;
+  const feedback = data.feedback;
+  const feedbackStatus = document.querySelector("#feedback-status");
+  const feedbackNote = document.querySelector("#feedback-note");
+  feedbackStatus.textContent = feedback
+    ? `Marked ${feedback.classification.replace("_", " ")} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}`
+    : "Was this result incorrect? Feedback is retained for review and does not automatically retrain the rules.";
+  feedbackStatus.classList.toggle("feedback-confirmed", Boolean(feedback));
+  feedbackNote.value = feedback?.note || "";
+  const pdfLink = document.querySelector("#pdf-link");
+  pdfLink.href = `/api/report/${encodeURIComponent(currentReportId)}/pdf`;
+  pdfLink.hidden = false;
+
+  const integrationNotice = document.querySelector("#integration-notice");
+  integrationNotice.textContent = `External checks not configured: AI (${data.integration_status.ai}), threat intelligence (${data.integration_status.threat_intelligence}), antivirus/sandbox (${data.integration_status.antivirus_sandbox}), Microsoft 365 (${data.integration_status.microsoft_365}). Authentication values are reported from supplied headers only.`;
+  renderCategories(data);
+
+  const findingsList = document.querySelector("#findings-list");
+  findingsList.replaceChildren();
+  for (const finding of data.findings) {
+    const row = document.createElement("li");
+    const indicator = document.createElement("span");
+    indicator.className = "finding-indicator";
+    indicator.textContent = finding.indicator || finding.category;
+    row.append(indicator);
+    const title = document.createElement("span");
+    title.textContent = finding.reason;
+    row.append(title);
+    const points = document.createElement("span");
+    points.className = "finding-points";
+    points.textContent = finding.points > 0 ? `+${finding.points} points` : finding.category;
+    row.append(points);
+    const evidence = document.createElement("span");
+    evidence.className = "finding-evidence";
+    evidence.textContent = `Evidence: ${finding.evidence}`;
+    row.append(evidence);
+    if (finding.language) {
+      const language = document.createElement("span");
+      language.className = "finding-quality";
+      language.textContent = `Matched language rule: ${finding.language.toUpperCase()}`;
+      row.append(language);
+    }
+    const reliability = finding.evidence_reliability;
+    if (reliability) {
+      const quality = document.createElement("span");
+      quality.className = `finding-quality evidence-${reliability.level}`;
+      quality.textContent = `Evidence reliability: ${reliability.level.toUpperCase()} — ${reliability.explanation}`;
+      row.append(quality);
+    }
+    const action = document.createElement("span");
+    action.className = "finding-action";
+    action.textContent = finding.points > 0
+      ? `Recommended action: ${recommendations[finding.category]}`
+      : "No configured indicator matched. Independently verify unexpected requests.";
+    row.append(action);
+    findingsList.append(row);
+  }
+
+  resultCard.hidden = false;
+  document.querySelector("#analysis-guidance").hidden = true;
+  resultCard.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function requestJson(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (["POST", "PUT", "PATCH", "DELETE"].includes((options.method || "GET").toUpperCase()) && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  const response = await fetch(path, { ...options, headers });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || "The analysis request failed.");
+  return result;
+}
+
+async function activateAccount(user, csrf) {
+  currentUser = user;
+  csrfToken = csrf;
+  document.querySelector("#app-shell").hidden = false;
+  document.querySelector("#account-tools").hidden = false;
+  document.querySelector("#account-label").textContent = `${user.username} · ${user.role}`;
+  const canInvestigate = ["analyst", "admin"].includes(user.role);
+  document.querySelector("#incident-card").hidden = !canInvestigate;
+  document.querySelector("#overview-incidents-card").hidden = !canInvestigate;
+  document.querySelector("#history-status-label").hidden = !canInvestigate;
+  document.querySelector("#history-status-header").hidden = !canInvestigate;
+  document.querySelectorAll(".analyst-nav").forEach((link) => { link.hidden = !canInvestigate; });
+  document.querySelectorAll(".admin-nav").forEach((link) => { link.hidden = user.role !== "admin"; });
+  document.querySelector("#admin-card").hidden = user.role !== "admin";
+  document.querySelector("#create-incident-button").hidden = !canInvestigate;
+  await loadHistory();
+  await loadAlerts();
+  if (canInvestigate) await loadIncidents();
+  if (user.role === "admin") await loadAdmin();
+}
+
+async function initializeApp() {
+  try {
+    const session = await requestJson("/api/session");
+    if (session.user) {
+      await activateAccount(session.user, session.csrf_token);
+    } else {
+      window.location.replace("/login");
+    }
+  } catch {
+    window.location.replace("/login");
+  }
+}
+
+function renderTrends(data) {
+  const summary = data.totals;
+  document.querySelector("#trend-summary").textContent =
+    `${summary.emails} email${summary.emails === 1 ? "" : "s"} analyzed · ${summary.high} high risk · ${summary.suspicious} suspicious · ${summary.low} low risk · ${summary.urls} URL${summary.urls === 1 ? "" : "s"} found`;
+  const chart = document.querySelector("#trend-chart");
+  chart.replaceChildren();
+  const maximum = Math.max(1, ...data.points.map((point) => point.total));
+  for (const point of data.points) {
+    const column = document.createElement("div");
+    column.className = "trend-column";
+    column.setAttribute("role", "listitem");
+    const date = point.period.length === 7 ? `${point.period}-01` : point.period;
+    const labelDate = new Date(`${date}T00:00:00Z`).toLocaleDateString(undefined, {
+      month: "short",
+      day: data.period === "day" ? "numeric" : undefined,
+      timeZone: "UTC",
+    });
+    column.setAttribute(
+      "aria-label",
+      `${point.period}: ${point.total} analyzed, ${point.high} high risk, ${point.suspicious} suspicious, ${point.low} low risk, ${point.urls} URLs`,
+    );
+    const count = document.createElement("span");
+    count.className = "trend-count";
+    count.textContent = point.total;
+    const bar = document.createElement("div");
+    bar.className = "trend-bar";
+    for (const level of ["low", "suspicious", "high"]) {
+      const segment = document.createElement("span");
+      segment.className = `trend-segment trend-${level}`;
+      segment.style.height = `${(point[level] / maximum) * 100}%`;
+      segment.setAttribute("aria-hidden", "true");
+      bar.append(segment);
+    }
+    const label = document.createElement("span");
+    label.className = "trend-date";
+    label.textContent = labelDate;
+    label.title = point.period;
+    column.append(count, bar, label);
+    chart.append(column);
+  }
+}
+
+async function loadTrends() {
+  const period = document.querySelector("#trend-period").value;
+  const data = await requestJson(`/api/trends?period=${encodeURIComponent(period)}`);
+  renderTrends(data);
+}
+
+async function loadHistory() {
+  try {
+    const params = new URLSearchParams();
+    const query = document.querySelector("#history-query").value.trim();
+    const risk = document.querySelector("#history-risk").value;
+    const status = document.querySelector("#history-status").value;
+    const from = document.querySelector("#history-from").value;
+    const to = document.querySelector("#history-to").value;
+    if (query) params.set("q", query);
+    if (risk) params.set("risk", risk);
+    if (status) params.set("status", status);
+    if (from) params.set("from", from);
+    if (to) params.set("to", to);
+    const queryString = params.toString();
+    const suffix = queryString ? `?${queryString}` : "";
+    const data = await requestJson(`/api/history${suffix}`);
+    document.querySelector("#count-total").textContent = data.counts.total;
+    document.querySelector("#count-high").textContent = data.counts.high;
+    document.querySelector("#count-suspicious").textContent = data.counts.suspicious;
+    document.querySelector("#count-low").textContent = data.counts.low;
+    renderSeverityDistribution(data.counts);
+    await loadTrends();
+    await renderThreatDetections();
+    document.querySelector("#history-match-count").textContent =
+      `Showing ${data.reports.length} of ${data.matched} matching reports (latest 100); dashboard totals cover all reports.`;
+    const rows = document.querySelector("#history-rows");
+    rows.replaceChildren();
+    if (data.reports.length === 0) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 8;
+      cell.textContent = "No reports yet.";
+      row.append(cell);
+      rows.append(row);
+      return;
+    }
+    for (const report of data.reports) {
+      const row = document.createElement("tr");
+      for (const value of [report.analyzed_at, report.subject, report.sender]) {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        row.append(cell);
+      }
+      const levelCell = document.createElement("td");
+      const levelBadge = document.createElement("span");
+      levelBadge.className = `risk-badge risk-${report.level.toLowerCase()}`;
+      levelBadge.textContent = report.level;
+      levelCell.append(levelBadge);
+      row.append(levelCell);
+      const scoreCell = document.createElement("td");
+      scoreCell.textContent = `${report.score}/100`;
+      row.append(scoreCell);
+      const statusCell = document.createElement("td");
+      statusCell.textContent = report.status === "none" ? "—" : report.status;
+      statusCell.hidden = !["analyst", "admin"].includes(currentUser?.role);
+      row.append(statusCell);
+      const feedbackCell = document.createElement("td");
+      feedbackCell.textContent = report.feedback ? report.feedback.replace("_", " ") : "—";
+      row.append(feedbackCell);
+      const actions = document.createElement("td");
+      const view = document.createElement("button");
+      view.type = "button";
+      view.className = "table-action";
+      view.dataset.viewReport = report.id;
+      view.textContent = "View";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "table-action";
+      remove.dataset.deleteReport = report.id;
+      remove.textContent = "Delete";
+      actions.append(view);
+      if (currentUser?.role === "admin") {
+        actions.append(document.createTextNode(" "), remove);
+      }
+      row.append(actions);
+      rows.append(row);
+    }
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not load analysis history.");
+  }
+}
+
+async function renderThreatDetections() {
+  const rows = document.querySelector("#threat-domain-rows");
+  rows.replaceChildren();
+  const { detections } = await requestJson("/api/threats");
+  if (!detections.length) {
+    const row = document.createElement("tr");
+    const empty = document.createElement("td");
+    empty.colSpan = 5;
+    empty.textContent = "No suspicious domains detected yet.";
+    row.append(empty);
+    rows.append(row);
+    return;
+  }
+  for (const detection of detections) {
+    const row = document.createElement("tr");
+    for (const value of [detection.domain, detection.reason]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    const riskCell = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = `risk-badge risk-${detection.level.toLowerCase()}`;
+    badge.textContent = detection.level;
+    riskCell.append(badge);
+    row.append(riskCell);
+    for (const value of [detection.subject, detection.analyzed_at]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    rows.append(row);
+  }
+}
+
+function renderSeverityDistribution(counts) {
+  const total = counts.high + counts.suspicious + counts.low;
+  const levels = [
+    { key: "low", label: "Low", count: counts.low },
+    { key: "suspicious", label: "Suspicious", count: counts.suspicious },
+    { key: "high", label: "High", count: counts.high },
+  ];
+  const summary = document.querySelector("#severity-summary");
+  const bar = document.querySelector("#severity-bar");
+  summary.textContent = total === 0
+    ? "No email reports analyzed yet."
+    : `${total} saved report${total === 1 ? "" : "s"} · ${counts.high} high · ${counts.suspicious} suspicious · ${counts.low} low`;
+  bar.setAttribute(
+    "aria-label",
+    total === 0
+      ? "Severity distribution: no reports yet"
+      : `Severity distribution: ${levels.map(({ label, count }) =>
+        `${label} ${count} (${Math.round(count * 100 / total)}%)`).join(", ")}`,
+  );
+
+  for (const { key, count } of levels) {
+    const percent = total === 0 ? 0 : Math.round(count * 100 / total);
+    document.querySelector(`#severity-bar-${key}`).style.width = `${percent}%`;
+    document.querySelector(`#severity-${key}-count`).textContent = count;
+    document.querySelector(`#severity-${key}-percent`).textContent = `${percent}%`;
+  }
+}
+
+async function loadAlerts() {
+  const data = await requestJson("/api/alerts");
+  const list = document.querySelector("#alerts-list");
+  list.replaceChildren();
+  const unacknowledged = data.alerts.filter((alert) => !alert.acknowledged_at).length;
+  document.querySelector("#alert-count").textContent = `${unacknowledged} unacknowledged`;
+  if (!data.alerts.length) {
+    const empty = document.createElement("li");
+    empty.className = "history-privacy";
+    empty.textContent = "No high-risk alerts.";
+    list.append(empty);
+    return;
+  }
+  for (const alert of data.alerts) {
+    const item = document.createElement("li");
+    item.className = "workflow-item";
+    const details = document.createElement("p");
+    details.textContent = `${alert.message} ${alert.subject ? `Subject: ${alert.subject}. ` : ""}`;
+    const status = document.createElement("span");
+    status.className = "subtle";
+    status.textContent = alert.acknowledged_at
+      ? `Acknowledged ${alert.acknowledged_at} by ${alert.acknowledged_by || "another user"}`
+      : `Created ${alert.created_at}`;
+    details.append(status);
+    item.append(details);
+    if (!alert.acknowledged_at) {
+      const acknowledge = document.createElement("button");
+      acknowledge.type = "button";
+      acknowledge.className = "table-action";
+      acknowledge.dataset.ackAlert = alert.id;
+      acknowledge.textContent = "Acknowledge";
+      item.append(acknowledge);
+    }
+    list.append(item);
+  }
+}
+
+async function loadIncidents() {
+  const [incidentData, teamData] = await Promise.all([
+    requestJson("/api/incidents"),
+    requestJson("/api/team"),
+  ]);
+  const container = document.querySelector("#incidents-list");
+  container.replaceChildren();
+  incidentReportIds = new Set(incidentData.incidents.map((incident) => incident.report_id));
+  const overview = document.querySelector("#overview-incidents");
+  overview.replaceChildren();
+  for (const incident of incidentData.incidents.slice(0, 4)) {
+    const item = document.createElement("li");
+    item.className = "workflow-item";
+    const details = document.createElement("p");
+    details.textContent = `${incident.subject || "(No subject)"} · ${incident.level} · ${incident.status}`;
+    const assignee = document.createElement("span");
+    assignee.className = "subtle";
+    assignee.textContent = `${incident.sender || "Unknown sender"} · ${incident.assignee || "Unassigned"} · Updated ${incident.updated_at}`;
+    item.append(details, assignee);
+    overview.append(item);
+  }
+  if (!incidentData.incidents.length) {
+    const empty = document.createElement("li");
+    empty.className = "history-privacy";
+    empty.textContent = "No security incidents have been opened.";
+    overview.append(empty);
+  }
+  if (!incidentData.incidents.length) {
+    const empty = document.createElement("p");
+    empty.className = "history-privacy";
+    empty.textContent = "No incidents have been created.";
+    container.append(empty);
+    return;
+  }
+  for (const incident of incidentData.incidents) {
+    const article = document.createElement("article");
+    article.className = "incident-item";
+    const heading = document.createElement("h3");
+    heading.textContent = incident.subject || "(No subject)";
+    const metadata = document.createElement("p");
+    metadata.textContent = `${incident.level} · score ${incident.score} · ${incident.sender || "Unknown sender"} · Report ${incident.report_id}`;
+    const controls = document.createElement("div");
+    controls.className = "incident-controls";
+    const statusLabel = document.createElement("label");
+    statusLabel.textContent = "Status";
+    const statusSelect = document.createElement("select");
+    statusSelect.dataset.incidentStatus = "";
+    for (const [value, label] of [["open", "Open"], ["investigating", "Investigating"], ["resolved", "Resolved"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      statusSelect.append(option);
+    }
+    statusSelect.value = incident.status;
+    statusLabel.append(statusSelect);
+    const assigneeLabel = document.createElement("label");
+    assigneeLabel.textContent = "Assigned analyst";
+    const assigneeSelect = document.createElement("select");
+    assigneeSelect.dataset.incidentAssignee = "";
+    const unassigned = document.createElement("option");
+    unassigned.value = "";
+    unassigned.textContent = "Unassigned";
+    assigneeSelect.append(unassigned);
+    for (const person of teamData.users) {
+      const option = document.createElement("option");
+      option.value = person.id;
+      option.textContent = `${person.username} (${person.role})`;
+      assigneeSelect.append(option);
+    }
+    assigneeSelect.value = incident.assigned_to || "";
+    assigneeLabel.append(assigneeSelect);
+    const noteLabel = document.createElement("label");
+    noteLabel.textContent = "Investigation note";
+    const note = document.createElement("textarea");
+    note.maxLength = 1000;
+    note.value = incident.note;
+    note.dataset.incidentNote = "";
+    noteLabel.append(note);
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "secondary-button";
+    save.dataset.saveIncident = incident.id;
+    save.textContent = "Save incident";
+    const timeline = document.createElement("ol");
+    timeline.className = "incident-timeline";
+    timeline.setAttribute("aria-label", "Incident evidence timeline");
+    for (const event of incident.timeline || []) {
+      const timelineEvent = document.createElement("li");
+      const updateDetails = [
+        event.status_updated ? `status: ${event.status}` : "",
+        event.assignment_updated ? "assignee updated" : "",
+        event.note_updated ? "investigation notes updated" : "",
+      ].filter(Boolean).join(" · ");
+      timelineEvent.textContent = `${event.created_at} · ${event.username} ${event.action === "incident.created" ? "created the incident" : `updated the incident${updateDetails ? ` · ${updateDetails}` : ""}`}`;
+      timeline.append(timelineEvent);
+    }
+    if (!timeline.childElementCount) {
+      const timelineEvent = document.createElement("li");
+      timelineEvent.textContent = `Incident opened ${incident.created_at}`;
+      timeline.append(timelineEvent);
+    }
+    controls.append(statusLabel, assigneeLabel, noteLabel, save);
+    article.append(heading, metadata, timeline, controls);
+    container.append(article);
+  }
+}
+
+async function loadAdmin() {
+  const [usersData, settingsData, auditData] = await Promise.all([
+    requestJson("/api/admin/users"),
+    requestJson("/api/admin/settings"),
+    requestJson("/api/admin/audit"),
+  ]);
+  const usersRows = document.querySelector("#users-rows");
+  usersRows.replaceChildren();
+  for (const user of usersData.users) {
+    const row = document.createElement("tr");
+    row.dataset.userId = user.id;
+    const username = document.createElement("td");
+    username.textContent = user.username;
+    const role = document.createElement("select");
+    role.className = "user-role-select";
+    role.dataset.userRole = "";
+    for (const value of ["user", "analyst", "admin"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      role.append(option);
+    }
+    role.value = user.role;
+    const roleCell = document.createElement("td");
+    roleCell.append(role);
+    const activeCell = document.createElement("td");
+    const active = document.createElement("input");
+    active.type = "checkbox";
+    active.checked = Boolean(user.active);
+    active.dataset.userActive = "";
+    active.setAttribute("aria-label", `Active account for ${user.username}`);
+    activeCell.append(active);
+    const actionsCell = document.createElement("td");
+    const password = document.createElement("input");
+    password.type = "password";
+    password.minLength = 12;
+    password.maxLength = 1024;
+    password.placeholder = "New password (optional)";
+    password.dataset.userPassword = "";
+    password.setAttribute("aria-label", `Reset password for ${user.username}`);
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "table-action";
+    save.dataset.saveUser = user.id;
+    save.textContent = "Save";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "table-action";
+    remove.dataset.deleteUser = user.id;
+    remove.textContent = "Delete";
+    actionsCell.append(password, document.createTextNode(" "), save, document.createTextNode(" "), remove);
+    row.append(username, roleCell, activeCell, actionsCell);
+    usersRows.append(row);
+  }
+  document.querySelector("#setting-alert-threshold").value = settingsData.settings.alert_threshold;
+  document.querySelector("#setting-retention-days").value = settingsData.settings.retention_days;
+  const auditRows = document.querySelector("#audit-rows");
+  auditRows.replaceChildren();
+  for (const entry of auditData.events) {
+    const row = document.createElement("tr");
+    for (const value of [entry.created_at, entry.username, entry.action, JSON.stringify(entry.details)]) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      row.append(cell);
+    }
+    auditRows.append(row);
+  }
+}
+
+document.querySelector("#logout-button").addEventListener("click", async () => {
+  clearError();
+  try {
+    await requestJson("/api/logout", { method: "POST" });
+    currentUser = null;
+    csrfToken = null;
+    window.location.replace("/login");
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not sign out.");
+  }
+});
+
+document.querySelector("#user-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = document.querySelector("#user-create-button");
+  const status = document.querySelector("#user-create-status");
+  status.hidden = true;
+  status.setAttribute("role", "status");
+  status.classList.remove("is-success");
+  status.textContent = "";
+  button.disabled = true;
+  button.textContent = "Creating account…";
+  try {
+    await requestJson("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: document.querySelector("#new-username").value,
+        password: document.querySelector("#new-password").value,
+        role: document.querySelector("#new-role").value,
+      }),
+    });
+    form.reset();
+    status.textContent = "Account created successfully. It is now available in the user list.";
+    status.classList.add("is-success");
+    status.hidden = false;
+    try {
+      await loadAdmin();
+      await loadIncidents();
+    } catch (error) {
+      status.textContent = `Account created, but the user list could not be refreshed. ${error instanceof Error ? error.message : ""}`.trim();
+      status.classList.remove("is-success");
+      status.setAttribute("role", "alert");
+    }
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : "Could not create user.";
+    status.hidden = false;
+    status.setAttribute("role", "alert");
+  } finally {
+    button.disabled = false;
+    button.textContent = "Create account";
+  }
+});
+
+document.querySelector("#settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  clearError();
+  try {
+    await requestJson("/api/admin/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        alert_threshold: Number(document.querySelector("#setting-alert-threshold").value),
+        retention_days: Number(document.querySelector("#setting-retention-days").value),
+      }),
+    });
+    await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not save policies.");
+  }
+});
+
+document.querySelector("#users-rows").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement)) return;
+  const userId = target.closest("tr")?.dataset.userId;
+  if (!userId) return;
+  clearError();
+  try {
+    if (target.dataset.saveUser) {
+      const row = target.closest("tr");
+      const password = row.querySelector("[data-user-password]").value;
+      const payload = {
+        role: row.querySelector("[data-user-role]").value,
+        active: row.querySelector("[data-user-active]").checked,
+      };
+      if (password) payload.password = password;
+      await requestJson(`/api/admin/users/${encodeURIComponent(userId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      await loadAdmin();
+      await loadIncidents();
+    } else if (target.dataset.deleteUser && window.confirm("Permanently delete this user?")) {
+      await requestJson(`/api/admin/users/${encodeURIComponent(userId)}`, { method: "DELETE" });
+      await loadAdmin();
+      await loadIncidents();
+    }
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not update the user.");
+  }
+});
+
+document.querySelector("#alerts-list").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement) || !target.dataset.ackAlert) return;
+  clearError();
+  try {
+    await requestJson("/api/alerts/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert_id: target.dataset.ackAlert }),
+    });
+    await loadAlerts();
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not acknowledge this alert.");
+  }
+});
+
+document.querySelector("#incidents-list").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement) || !target.dataset.saveIncident) return;
+  const card = target.closest(".incident-item");
+  clearError();
+  try {
+    await requestJson(`/api/incidents/${encodeURIComponent(target.dataset.saveIncident)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status: card.querySelector("[data-incident-status]").value,
+        assigned_to: card.querySelector("[data-incident-assignee]").value || null,
+        note: card.querySelector("[data-incident-note]").value,
+      }),
+    });
+    await loadIncidents();
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not update the incident.");
+  }
+});
+
+document.querySelector("#create-incident-button").addEventListener("click", async () => {
+  clearError();
+  if (!currentReportId) {
+    showError("Open a saved report before creating an incident.");
+    return;
+  }
+  try {
+    await requestJson("/api/incidents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report_id: currentReportId }),
+    });
+    await loadIncidents();
+    document.querySelector("#create-incident-button").disabled = true;
+    document.querySelector("#create-incident-button").textContent = "Incident already created";
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not create an incident.");
+  }
+});
+
+document.querySelector("#trend-period").addEventListener("change", async () => {
+  clearError();
+  try {
+    await loadTrends();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not load trend data.");
+  }
+});
+
+previewButton.addEventListener("click", async () => {
+  clearError();
+  const input = getEmailInput();
+  const { email } = input;
+  if (!email.trim()) {
+    showError("Email content is empty. Paste a message or choose a non-empty file.");
+    return;
+  }
+  if (new TextEncoder().encode(email).length > 10 * 1024 * 1024) {
+    showError("Email text exceeds the 10 MB limit.");
+    return;
+  }
+  previewButton.disabled = true;
+  previewButton.textContent = "Extracting…";
+  try {
+    const data = await requestJson("/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    previewedInput = input;
+    renderPreview(data);
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not extract email details.");
+  } finally {
+    previewButton.disabled = false;
+    previewButton.textContent = "Preview extracted details";
+  }
+});
+
+document.querySelector("#history-filter").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  clearError();
+  await loadHistory();
+});
+
+document.querySelector("#reset-history-filter").addEventListener("click", async () => {
+  document.querySelector("#history-filter").reset();
+  clearError();
+  await loadHistory();
+});
+
+for (const [buttonId, classification] of [
+  ["false-positive-button", "false_positive"],
+  ["false-negative-button", "false_negative"],
+]) {
+  document.querySelector(`#${buttonId}`).addEventListener("click", async () => {
+    clearError();
+    if (!currentReportId) {
+      showError("Analyze or open a saved report before submitting feedback.");
+      return;
+    }
+    try {
+      const feedback = await requestJson(
+        `/api/report/${encodeURIComponent(currentReportId)}/feedback`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            classification,
+            note: document.querySelector("#feedback-note").value,
+          }),
+        },
+      );
+      document.querySelector("#feedback-status").textContent =
+        `Marked ${feedback.classification.replace("_", " ")} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}`;
+      document.querySelector("#feedback-status").classList.add("feedback-confirmed");
+      await loadHistory();
+    } catch (error) {
+      showError(error instanceof Error ? error.message : "Could not save feedback.");
+    }
+  });
+}
+
+analyzeButton.addEventListener("click", async () => {
+  clearError();
+  const input = getEmailInput();
+  const email = input.email;
+  if (JSON.stringify(previewedInput) !== JSON.stringify(input)) {
+    analyzeButton.disabled = true;
+    previewCard.hidden = true;
+    showError("Preview the current email before analyzing it.");
+    return;
+  }
+  analyzeButton.disabled = true;
+  analyzeButton.textContent = "Analyzing…";
+  try {
+    const result = await requestJson("/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    renderResult(result);
+    await loadHistory();
+    await loadAlerts();
+    if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "The analyzer could not be reached.");
+  } finally {
+    analyzeButton.disabled = false;
+    analyzeButton.textContent = "Analyze and save report";
+  }
+});
+
+emailInput.addEventListener("input", () => {
+  previewedInput = null;
+  analyzeButton.disabled = true;
+  previewCard.hidden = true;
+  resultCard.hidden = true;
+  document.querySelector("#analysis-guidance").hidden = false;
+});
+
+for (const input of [subjectInput, fromInput, toInput, replyToInput]) {
+  input.addEventListener("input", () => {
+    previewedInput = null;
+    analyzeButton.disabled = true;
+    previewCard.hidden = true;
+    resultCard.hidden = true;
+    document.querySelector("#analysis-guidance").hidden = false;
+  });
+}
+
+async function loadEmailFile(file) {
+  clearError();
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".eml") && !file.name.toLowerCase().endsWith(".txt")) {
+    fileInput.value = "";
+    showError("Choose a .eml or .txt file. Images and other formats are not supported.");
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    fileInput.value = "";
+    showError("Please choose an email or text file no larger than 10 MB.");
+    return;
+  }
+  try {
+    emailInput.value = await file.text();
+    fileName.textContent = `Loaded: ${file.name} (${file.size.toLocaleString()} bytes)`;
+    previewedInput = null;
+    analyzeButton.disabled = true;
+    previewCard.hidden = true;
+    resultCard.hidden = true;
+    document.querySelector("#analysis-guidance").hidden = false;
+  } catch {
+    showError("Could not read that file. Choose a UTF-8 .eml or .txt file.");
+  }
+}
+
+fileInput.addEventListener("change", () => {
+  void loadEmailFile(fileInput.files?.[0]);
+});
+
+const inputCard = document.querySelector(".input-card");
+for (const eventName of ["dragenter", "dragover"]) {
+  inputCard.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    inputCard.classList.add("is-dragging");
+  });
+}
+for (const eventName of ["dragleave", "drop"]) {
+  inputCard.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    inputCard.classList.remove("is-dragging");
+  });
+}
+inputCard.addEventListener("drop", (event) => {
+  const file = event.dataTransfer?.files?.[0];
+  if (file) void loadEmailFile(file);
+});
+
+document.querySelector("#history-rows").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement)) return;
+  try {
+    if (target.dataset.viewReport) {
+      const report = await requestJson(`/api/report/${encodeURIComponent(target.dataset.viewReport)}`);
+      renderResult(report);
+    } else if (target.dataset.deleteReport && window.confirm("Delete this saved report?")) {
+      await requestJson(`/api/report/${encodeURIComponent(target.dataset.deleteReport)}`, { method: "DELETE" });
+      await loadHistory();
+      await loadAlerts();
+      if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
+      if (currentUser?.role === "admin") await loadAdmin();
+      if (document.querySelector("#report-date").textContent.includes(target.dataset.deleteReport)) {
+        resultCard.hidden = true;
+        currentReportId = null;
+      }
+    }
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not update analysis history.");
+  }
+});
+
+document.querySelector("#clear-button").addEventListener("click", () => {
+  emailInput.value = "";
+  subjectInput.value = "";
+  fromInput.value = "";
+  toInput.value = "";
+  replyToInput.value = "";
+  fileInput.value = "";
+  fileName.textContent = "No file selected. Images are not supported.";
+  previewedInput = null;
+  analyzeButton.disabled = true;
+  previewCard.hidden = true;
+  resultCard.hidden = true;
+  document.querySelector("#analysis-guidance").hidden = false;
+  clearError();
+});
+
+initializeApp();

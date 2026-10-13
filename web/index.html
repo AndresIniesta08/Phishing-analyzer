@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#102d2a">
+    <title>Email Phishing Risk Analyzer</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <p class="eyebrow">EMAIL SECURITY</p>
+        <h1>Phishing risk analyzer</h1>
+        <p class="header-copy">Evidence-led analysis for safer email decisions.</p>
+        <div id="account-tools" class="account-tools" hidden>
+          <span id="account-label"></span>
+          <button id="logout-button" class="secondary-button" type="button">Sign out</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="app-shell" class="layout" hidden>
+      <aside class="sidebar" aria-label="Main navigation">
+        <a class="sidebar-brand" href="#overview" aria-label="Manvish Security overview">
+          <span class="brand-mark">M</span>
+          <span><strong>MANVISH</strong><small>SECURITY</small></span>
+        </a>
+        <nav class="sidebar-nav">
+          <a class="nav-link is-active" href="#overview" aria-current="page"><span aria-hidden="true">◫</span>Overview</a>
+          <a class="nav-link" href="#email-analysis"><span aria-hidden="true">✉</span>Email Analysis</a>
+          <a class="nav-link" href="#threat-detections"><span aria-hidden="true">⌁</span>Threat Detections</a>
+          <a class="nav-link analyst-nav" href="#investigations" hidden><span aria-hidden="true">◎</span>Investigations</a>
+          <a class="nav-link" href="#analysis-history"><span aria-hidden="true">◷</span>Analysis History</a>
+          <a class="nav-link" href="#reports-analytics"><span aria-hidden="true">▥</span>Reports &amp; Analytics</a>
+          <a class="nav-link admin-nav" href="#integrations" hidden><span aria-hidden="true">⌘</span>Integrations</a>
+          <a class="nav-link admin-nav" href="#user-management" hidden><span aria-hidden="true">♙</span>User Management</a>
+          <a class="nav-link admin-nav" href="#settings" hidden><span aria-hidden="true">⚙</span>Settings</a>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="sidebar-indicator"></span>
+          <span>Security workspace</span>
+        </div>
+      </aside>
+      <div class="workspace-content">
+      <section id="overview" class="dashboard" aria-label="Security overview">
+        <article class="metric"><span>Total analyzed</span><strong id="count-total">0</strong></article>
+        <article class="metric metric-high"><span>High risk</span><strong id="count-high">0</strong></article>
+        <article class="metric metric-suspicious"><span>Suspicious</span><strong id="count-suspicious">0</strong></article>
+        <article class="metric metric-low"><span>Low risk</span><strong id="count-low">0</strong></article>
+      </section>
+
+      <section id="reports-analytics" class="card severity-card" aria-labelledby="severity-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">ALL SAVED REPORTS</p><h2 id="severity-title">Severity distribution</h2></div>
+          <span class="status-tag">Updated with analysis history</span>
+        </div>
+        <p id="severity-summary" class="severity-summary" aria-live="polite">No email reports analyzed yet.</p>
+        <div id="severity-bar" class="severity-bar" role="img" aria-label="Severity distribution: no reports yet">
+          <span id="severity-bar-low" class="severity-segment severity-low"></span>
+          <span id="severity-bar-suspicious" class="severity-segment severity-suspicious"></span>
+          <span id="severity-bar-high" class="severity-segment severity-high"></span>
+        </div>
+        <ul class="severity-legend" aria-label="Severity counts">
+          <li><span class="severity-key severity-high"></span><span>High</span><strong id="severity-high-count">0</strong><span id="severity-high-percent">0%</span></li>
+          <li><span class="severity-key severity-suspicious"></span><span>Suspicious</span><strong id="severity-suspicious-count">0</strong><span id="severity-suspicious-percent">0%</span></li>
+          <li><span class="severity-key severity-low"></span><span>Low</span><strong id="severity-low-count">0</strong><span id="severity-low-percent">0%</span></li>
+        </ul>
+      </section>
+
+      <section class="card trend-card" aria-labelledby="trend-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">ANALYSIS TRENDS</p>
+            <h2 id="trend-title">Risk trends</h2>
+          </div>
+          <label class="trend-period-label" for="trend-period">View by
+            <select id="trend-period">
+              <option value="day">Last 30 days</option>
+              <option value="month">Last 12 months</option>
+            </select>
+          </label>
+        </div>
+        <p id="trend-summary" class="trend-summary" aria-live="polite">Loading trend data…</p>
+        <div class="trend-legend" aria-label="Chart legend">
+          <span><i class="trend-swatch trend-high"></i>High</span>
+          <span><i class="trend-swatch trend-suspicious"></i>Suspicious</span>
+          <span><i class="trend-swatch trend-low"></i>Low</span>
+        </div>
+        <div class="trend-chart-viewport">
+          <div id="trend-chart" class="trend-chart" role="list" aria-label="Email analysis counts over time"></div>
+        </div>
+      </section>
+
+      <section id="alerts-card" class="card" aria-labelledby="alerts-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">NOTIFICATIONS</p><h2 id="alerts-title">High-risk alerts</h2></div>
+          <span id="alert-count" class="status-tag">0 unacknowledged</span>
+        </div>
+        <p class="history-privacy">Alerts appear here. External email and push notifications are not configured.</p>
+        <ul id="alerts-list" class="workflow-list"></ul>
+      </section>
+
+      <section id="overview-incidents-card" class="card" aria-labelledby="overview-incidents-title" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">INVESTIGATION ACTIVITY</p><h2 id="overview-incidents-title">Recent security incidents</h2></div>
+          <a class="text-link" href="#investigations">View investigations</a>
+        </div>
+        <ul id="overview-incidents" class="workflow-list"></ul>
+      </section>
+
+      <section id="threat-detections" class="card" aria-labelledby="threat-detections-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">URL INDICATORS</p><h2 id="threat-detections-title">Latest suspicious domains</h2></div>
+          <span class="status-tag">Reputation not independently checked</span>
+        </div>
+        <p class="history-privacy">Domains listed here were associated with URL indicators in analyzed messages. This is not a live threat-intelligence verdict.</p>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Domain</th><th>Detection</th><th>Risk</th><th>Message</th><th>Detected</th></tr></thead>
+            <tbody id="threat-domain-rows"><tr><td colspan="5">No suspicious domains detected yet.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="incident-card" class="card" aria-labelledby="incidents-title" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ANALYST WORKFLOW</p><h2 id="incidents-title">Incidents</h2></div>
+        </div>
+        <p class="history-privacy">Track review status and analyst assignment for reports. Email quarantine and remediation are not configured.</p>
+        <div id="incidents-list" class="incident-list"></div>
+      </section>
+
+      <section id="admin-card" class="card" aria-labelledby="admin-title" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">ADMINISTRATOR</p><h2 id="admin-title">Administration</h2></div>
+        </div>
+        <form id="user-create-form" class="admin-form">
+          <h3 id="user-management">Provision user account</h3>
+          <p class="admin-help">Self-registration is disabled. Only administrators can create accounts and assign user, analyst, or administrator access.</p>
+          <label>Username<input id="new-username" minlength="3" maxlength="64" pattern="[A-Za-z0-9_.-]{3,64}" title="Use 3–64 letters, numbers, periods, underscores, or hyphens." autocomplete="off" required></label>
+          <label>Temporary password<input id="new-password" type="password" minlength="12" maxlength="1024" autocomplete="new-password" aria-describedby="new-password-help" required></label>
+          <p id="new-password-help" class="field-help">Use at least 12 characters. Share the temporary password securely and ask the user to change it after signing in.</p>
+          <label>Role<select id="new-role"><option value="user">User</option><option value="analyst">Analyst</option><option value="admin">Administrator</option></select></label>
+          <p id="user-create-status" class="form-status" role="status" aria-live="polite" hidden></p>
+          <button id="user-create-button" class="primary-button" type="submit">Create account</button>
+        </form>
+        <h3>Users</h3>
+        <div class="table-scroll"><table><thead><tr><th>Username</th><th>Role</th><th>Active</th><th>Actions</th></tr></thead><tbody id="users-rows"></tbody></table></div>
+        <form id="settings-form" class="admin-form settings-form">
+          <h3 id="settings">Policies</h3>
+          <label>High-risk alert threshold (score)<input id="setting-alert-threshold" type="number" min="0" max="100" required></label>
+          <label>Report retention (days; 0 = manual deletion)<input id="setting-retention-days" type="number" min="0" max="3650" required></label>
+          <p class="history-privacy">When retention is enabled, expired reports and linked incidents/alerts are removed on the next analysis. Audit records are retained.</p>
+          <button class="primary-button" type="submit">Save policies</button>
+        </form>
+        <h3>Recent audit events</h3>
+        <p class="history-privacy">Audit entries record account and workflow actions, not email bodies.</p>
+        <div class="table-scroll"><table><thead><tr><th>Date (UTC)</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
+      </section>
+
+      <div id="email-analysis" class="analysis-workspace">
+      <section class="card input-card" aria-labelledby="input-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">MESSAGE REVIEW</p>
+            <h2 id="input-title">Email content</h2>
+          </div>
+          <label class="file-button" for="email-file">Upload .eml or .txt</label>
+          <input id="email-file" class="visually-hidden" type="file" accept=".eml,.txt,text/plain,message/rfc822">
+        </div>
+        <div class="email-header-grid">
+          <label class="email-field" for="email-from">
+            <span class="input-label">From</span>
+            <input id="email-from" type="text" maxlength="998" placeholder="Sender name or address">
+          </label>
+          <label class="email-field" for="email-to">
+            <span class="input-label">To</span>
+            <input id="email-to" type="text" maxlength="998" placeholder="Recipient name or address">
+          </label>
+          <label class="email-field" for="email-reply-to">
+            <span class="input-label">Reply-To</span>
+            <input id="email-reply-to" type="text" maxlength="998" placeholder="Optional reply address">
+          </label>
+        </div>
+        <label class="input-label" for="email-subject">Subject</label>
+        <input id="email-subject" class="email-subject" type="text" maxlength="998" placeholder="Enter the email subject, if available">
+        <label class="visually-hidden" for="email-input">Paste email content</label>
+        <p id="email-drop-zone" class="drop-zone">Drop an <strong>.eml</strong> file here or paste message content below.</p>
+        <textarea id="email-input" spellcheck="false" placeholder="Paste email content or the full message here. Headers are optional."></textarea>
+        <p id="file-name" class="file-name">No file selected. Images are not supported.</p>
+        <div class="actions">
+          <button id="preview-button" class="secondary-button" type="button">Preview extracted details</button>
+          <button id="analyze-button" class="primary-button" type="button" disabled>Analyze and save report</button>
+          <button id="clear-button" class="secondary-button" type="button">Clear</button>
+          <span class="action-note">Links are never opened during analysis</span>
+        </div>
+        <p id="error-message" class="error-message" role="alert" hidden></p>
+      </section>
+
+      <div id="analysis-guidance" class="card analysis-guidance">
+        <span class="guidance-icon" aria-hidden="true">✉</span>
+        <h2>Ready to analyze</h2>
+        <p>Upload an .eml file or paste a message to review its sender, links, attachments, and authentication details.</p>
+        <ul><li>Preview extracted email evidence</li><li>Review risk score and severity</li><li>See indicators and recommended actions</li></ul>
+      </div>
+
+      <section id="preview-card" class="card analysis-side-card" aria-labelledby="preview-title" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">MESSAGE PREVIEW</p>
+            <h2 id="preview-title">Extracted email details</h2>
+          </div>
+          <span class="status-tag">Preview only · not saved</span>
+        </div>
+        <dl id="email-fields" class="email-fields"></dl>
+        <div class="preview-grid">
+          <div><h3>Authentication results</h3><ul id="auth-preview" class="compact-list"></ul></div>
+          <div><h3>Links</h3><ul id="links-preview" class="compact-list"></ul></div>
+          <div><h3>Attachments</h3><ul id="attachments-preview" class="compact-list"></ul></div>
+        </div>
+        <details class="body-preview">
+          <summary>Preview extracted message body</summary>
+          <pre id="body-preview"></pre>
+        </details>
+      </section>
+
+      <section id="result-card" class="card analysis-side-card" aria-labelledby="result-title" hidden aria-live="polite">
+        <div class="section-heading">
+          <div><p class="eyebrow">SAVED REPORT</p><h2 id="result-title">Analysis results</h2></div>
+        </div>
+        <div id="risk-banner" class="risk-banner">
+          <div><p class="eyebrow">RISK LEVEL</p><h3 id="risk-level"></h3></div>
+          <div class="score-block"><span id="risk-score" class="risk-score"></span><span class="score-caption">/ 100</span></div>
+        </div>
+        <section class="explainability-panel" aria-labelledby="explainability-title">
+          <h3 id="explainability-title">Detection confidence and explainability</h3>
+          <p id="scoring-explanation"></p>
+          <p id="confidence-explanation"></p>
+          <p id="language-explanation"></p>
+        </section>
+        <p id="report-date" class="report-date"></p>
+        <div id="integration-notice" class="integration-notice"></div>
+        <div id="category-results" class="category-grid"></div>
+        <h3 class="findings-title">Evidence and recommended action</h3>
+        <ul id="findings-list" class="findings-list"></ul>
+        <div class="feedback-panel">
+          <div>
+            <h3>Classification feedback</h3>
+            <p id="feedback-status">Was this result incorrect? Feedback is retained for review and does not automatically retrain the rules.</p>
+          </div>
+          <label class="feedback-note-label" for="feedback-note">Optional note</label>
+          <textarea id="feedback-note" class="feedback-note" maxlength="1000" placeholder="Briefly explain the correction (optional)."></textarea>
+          <div class="actions">
+            <button id="create-incident-button" class="secondary-button feedback-button" type="button" hidden>Create incident</button>
+            <button id="false-positive-button" class="secondary-button feedback-button" type="button">Mark as false positive</button>
+            <button id="false-negative-button" class="secondary-button feedback-button" type="button">Mark as false negative</button>
+            <a id="pdf-link" class="file-button export-link" href="#" hidden>Download detailed PDF report</a>
+          </div>
+        </div>
+      </section>
+
+      </div>
+
+      <section id="analysis-history" class="card history-card" aria-labelledby="history-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">REPORTS</p><h2 id="history-title">Analysis history</h2></div>
+          <a class="file-button export-link" href="/api/export.csv">Export CSV</a>
+        </div>
+        <p class="history-privacy">History stores the subject, sender, score, findings, URLs and attachment metadata—not the email body or attachment contents. Reports remain in the application data folder until deleted.</p>
+        <form id="history-filter" class="history-filter">
+          <label>Search sender or subject<input id="history-query" type="search" maxlength="200" placeholder="Search sender, subject, or domain"></label>
+          <label>Risk level<select id="history-risk"><option value="">All risks</option><option value="LOW">Low risk</option><option value="SUSPICIOUS">Suspicious</option><option value="HIGH">High risk</option></select></label>
+          <label id="history-status-label" hidden>Incident status<select id="history-status"><option value="">All statuses</option><option value="none">No incident</option><option value="open">Open</option><option value="investigating">Investigating</option><option value="resolved">Resolved</option></select></label>
+          <label>From date<input id="history-from" type="date"></label>
+          <label>To date<input id="history-to" type="date"></label>
+          <button class="primary-button" type="submit">Search</button>
+          <button id="reset-history-filter" class="secondary-button" type="button">Reset</button>
+        </form>
+        <p id="history-match-count" class="history-privacy"></p>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>Date (UTC)</th><th>Subject</th><th>Sender</th><th>Result</th><th>Score</th><th id="history-status-header" hidden>Status</th><th>Feedback</th><th>Actions</th></tr></thead>
+            <tbody id="history-rows"><tr><td colspan="7">No reports yet.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="integrations" class="card integrations-card" aria-labelledby="integrations-title">
+        <div class="section-heading"><div><p class="eyebrow">CONNECTED SERVICES</p><h2 id="integrations-title">Integrations</h2></div></div>
+        <p class="history-privacy">Integration availability is shown transparently. No external reputation, scanning, or mailbox-remediation service is currently connected.</p>
+        <div class="integration-grid">
+          <article><strong>Threat intelligence</strong><span>Not connected</span></article>
+          <article><strong>Antivirus and sandbox</strong><span>Not connected</span></article>
+          <article><strong>Microsoft 365 / Defender</strong><span>Not connected</span></article>
+          <article><strong>Notifications and quarantine</strong><span>Not connected</span></article>
+        </div>
+      </section>
+
+      <aside class="privacy-note">
+        <strong>Analysis limitation:</strong> SPF, DKIM, and DMARC results are read from supplied headers and are not independently validated. File hashes are calculated by this application.
+      </aside>
+      </div>
+    </main>
+  </body>
+</html>

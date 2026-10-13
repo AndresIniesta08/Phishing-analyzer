@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#102d2a">
+    <title>Sign in · Email Phishing Risk Analyzer</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/login.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="header-inner">
+        <p class="eyebrow">EMAIL SECURITY</p>
+        <h1>Phishing risk analyzer</h1>
+        <p class="header-copy">Sign in to review and analyze email security reports.</p>
+      </div>
+    </header>
+
+    <main class="auth-screen card" aria-labelledby="auth-title">
+      <p class="eyebrow">SECURE ACCESS</p>
+      <h2 id="auth-title">Sign in</h2>
+      <p id="auth-description">Sign in to access the analyzer and review security reports. Accounts are provisioned by an administrator.</p>
+      <form id="auth-form" class="auth-form">
+        <label>Username<input id="auth-username" name="username" minlength="3" maxlength="64" autocomplete="username" required></label>
+        <label>Password<input id="auth-password" name="password" type="password" minlength="12" maxlength="1024" autocomplete="current-password" required></label>
+        <button id="auth-submit" class="primary-button" type="submit">Sign in</button>
+      </form>
+      <p id="auth-error" class="error-message" role="alert" hidden></p>
+      <p class="account-help">Need access? Contact your security administrator. For first-time setup, an administrator must create the initial account from the application console.</p>
+    </main>
+  </body>
+</html>
