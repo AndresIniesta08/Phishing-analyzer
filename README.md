@@ -53,6 +53,24 @@ internet. Local accounts share this device's report history; the app does not
 provide tenant isolation. Do not expose it to a network or deploy it publicly
 as-is.
 
+### Optional VirusTotal reputation lookup
+
+Set `VIRUSTOTAL_API_KEY` in the server process environment before startup to
+enable the integration. For example, in PowerShell:
+
+```powershell
+$env:VIRUSTOTAL_API_KEY = "YOUR_VIRUSTOTAL_API_KEY"
+python .\web_app.py
+```
+
+The key is not stored in the application database or returned to the browser.
+Analysts opt in separately for each analysis. The app queries up to five unique
+URLs and their domains; it sends neither email bodies nor attachments and never
+opens the links. VirusTotal states queried indicators may be added to its public
+dataset. Do not query confidential or personal indicators. Available engine
+counts, domain details, and reported redirects are shown; missing or
+rate-limited lookups are not treated as safe.
+
 ## Analyze a message
 
 1. Enter optional **From**, **To**, **Reply-To**, and **Subject** values in their
@@ -65,28 +83,29 @@ as-is.
    results.
 3. Select **Analyze and save report**. Findings are categorized as sender,
    content, URLs, or attachments, with evidence and recommended actions.
-4. Review the dashboard's all-time LOW, SUSPICIOUS, and HIGH severity counts
-   and distribution, plus the daily (last 30 days) or monthly (last 12 months)
-   trend chart and extracted URL counts.
-5. Analysts/admins can create incidents from reports, assign an analyst, add
-   investigation notes, and review a timeline of incident status and note
-   updates. High-risk score thresholds produce in-app alerts that users can
-   acknowledge.
+4. Review risk counts, analyst-reviewed legitimate classifications, common
+   indicators, and daily/monthly analysis trends on the dashboard.
+5. Analysts/admins can create cases from reports, set case severity and status,
+   assign an analyst, add investigation notes, and review a timeline of status,
+   severity, assignment, and note changes. High-risk score thresholds produce
+   in-app alerts that users can acknowledge.
 6. Admins can create accounts and assign user/analyst/admin roles, set the
    alert threshold, and configure report retention. Admins can review recent
-   audit events. Users can search/filter history, review reports, submit
-   false-positive/false-negative feedback, filter by incident status, search
+   audit events and review analyst classifications. Analysts submit a
+   classification with a required reason. Administrators can approve a bounded
+   point adjustment for a matched indicator or reject the review; adjustments
+   affect future analyses only, and saved reports are not recalculated. Users
+   can search/filter history, review reports, filter cases by status, search
    extracted domains, or export CSV/PDF.
 
 The sidebar links to the overview, analysis workspace, threat detections,
 investigations, history, analytics, integrations, user management, and settings.
 Administrator-only and analyst-only entries are role-gated. Domains shown under
-threat detections are associated with configured URL-pattern indicators; because
-live threat-intelligence lookups are not configured, they are not validated as
-known malicious domains.
+threat detections are associated with URL indicators; they are not independently
+verified unless an analyst opted in to a configured VirusTotal lookup.
 
-Feedback is a local review annotation; it does not automatically change or
-retrain the detection rules. History search returns the latest 100 matching
+Feedback is an analyst review annotation. Rule adjustments require an explicit
+administrator approval and are never learned automatically. History search returns the latest 100 matching
 reports, while dashboard counters summarize all stored reports. Trend charts
 aggregate the local report history into UTC day/month buckets; they do not
 estimate risk probability or use external data.
@@ -109,16 +128,16 @@ analyzed; audit records remain. Use `0` for manual report deletion only.
 Attachment bytes are never opened or executed. The app calculates SHA-256
 locally and flags risky filename extensions; it does not scan files. Supplied
 SPF/DKIM/DMARC header values are displayed but not independently verified.
-Links are extracted but never opened or checked against live reputation
-services. Screenshot files are unsupported: inspect screenshots manually and
-paste a faithful transcription of their visible text.
+Links are extracted but never opened. VirusTotal checks require an API key and
+per-analysis opt-in. Screenshot files are unsupported: inspect screenshots
+manually and paste a faithful transcription of their visible text.
 
 Saved history is under `%LOCALAPPDATA%\EmailPhishingRiskAnalyzer\history.sqlite3`
 on Windows. It stores report metadata (including sender, subject, findings,
 URLs, attachment names/hashes, and user feedback) but not the email body or
-attachment bytes. Delete individual reports in the UI. No AI, online threat intelligence,
-antivirus/sandbox, Microsoft 365/Defender, external notifications, or
-quarantine integration is configured. AI analysis requires an explicitly
+attachment bytes. Delete individual reports in the UI. VirusTotal is optional;
+AI, antivirus/sandbox, Microsoft 365/Defender, external notifications, and
+quarantine integrations are not configured. AI analysis requires an explicitly
 approved model/provider and privacy review. Microsoft Graph/Defender and
 authorized quarantine require tenant access and permissions; the app does not
 simulate these integrations.

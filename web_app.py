@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -17,6 +18,9 @@ import re
 import secrets
 import sqlite3
 import uuid
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request as UrlRequest, urlopen as http_urlopen
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -34,7 +38,13 @@ SESSION_COOKIE = "phishing_session"
 SESSION_TTL_HOURS = 8
 PASSWORD_ITERATIONS = 310_000
 VALID_ROLES = {"user", "analyst", "admin"}
-VALID_INCIDENT_STATUSES = {"open", "investigating", "resolved"}
+VALID_INCIDENT_STATUSES = {"open", "investigating", "resolved", "false_positive"}
+VALID_INCIDENT_SEVERITIES = {"low", "medium", "high", "critical"}
+VALID_FEEDBACK_CLASSIFICATIONS = {
+    "confirmed_phishing", "suspicious", "legitimate", "false_positive",
+}
+MAX_REPUTATION_LOOKUPS = 5
+VIRUSTOTAL_API_URL = "https://www.virustotal.com/api/v3"
 
 
 def _default_data_dir() -> Path:
@@ -80,8 +90,10 @@ def _connect() -> sqlite3.Connection:
     connection.execute(
         """CREATE TABLE IF NOT EXISTS feedback (
             report_id TEXT PRIMARY KEY REFERENCES reports(id) ON DELETE CASCADE,
-            classification TEXT NOT NULL CHECK(classification IN ('false_positive', 'false_negative')),
+            classification TEXT NOT NULL CHECK(classification IN
+                ('confirmed_phishing', 'suspicious', 'legitimate', 'false_positive')),
             note TEXT NOT NULL DEFAULT '',
+            submitted_by TEXT NOT NULL DEFAULT '',
             submitted_at TEXT NOT NULL
         )"""
     )
@@ -110,11 +122,41 @@ def _connect() -> sqlite3.Connection:
             report_id TEXT NOT NULL UNIQUE REFERENCES reports(id) ON DELETE CASCADE,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('open', 'investigating', 'resolved')),
+            status TEXT NOT NULL CHECK(status IN ('open', 'investigating', 'resolved', 'false_positive')),
+            severity TEXT NOT NULL DEFAULT 'medium' CHECK(severity IN ('low', 'medium', 'high', 'critical')),
             assigned_to TEXT REFERENCES users(id) ON DELETE SET NULL,
             note TEXT NOT NULL DEFAULT ''
         )"""
     )
+    _migrate_feedback_schema(connection)
+    _migrate_incident_schema(connection)
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS feedback_reviews (
+            report_id TEXT PRIMARY KEY REFERENCES reports(id) ON DELETE CASCADE,
+            decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected')),
+            reviewed_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            reviewed_at TEXT NOT NULL,
+            indicator TEXT,
+            points_delta INTEGER,
+            note TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS rule_adjustments (
+            indicator TEXT PRIMARY KEY,
+            points_delta INTEGER NOT NULL CHECK(points_delta BETWEEN -25 AND 25),
+            updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+            updated_at TEXT NOT NULL,
+            source_report_id TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    adjustment_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(rule_adjustments)").fetchall()
+    }
+    if "source_report_id" not in adjustment_columns:
+        connection.execute(
+            "ALTER TABLE rule_adjustments ADD COLUMN source_report_id TEXT NOT NULL DEFAULT ''"
+        )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS alerts (
             id TEXT PRIMARY KEY,
@@ -147,6 +189,208 @@ def _connect() -> sqlite3.Connection:
     )
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
+
+
+def _migrate_feedback_schema(connection: sqlite3.Connection) -> None:
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'feedback'"
+    ).fetchone()
+    if schema is not None and "false_negative" in str(schema["sql"]):
+        connection.execute("ALTER TABLE feedback RENAME TO feedback_legacy")
+        connection.execute(
+            """CREATE TABLE feedback (
+                report_id TEXT PRIMARY KEY REFERENCES reports(id) ON DELETE CASCADE,
+                classification TEXT NOT NULL CHECK(classification IN
+                    ('confirmed_phishing', 'suspicious', 'legitimate', 'false_positive')),
+                note TEXT NOT NULL DEFAULT '',
+                submitted_by TEXT NOT NULL DEFAULT '',
+                submitted_at TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO feedback(report_id, classification, note, submitted_by, submitted_at)
+            SELECT report_id,
+                CASE classification WHEN 'false_negative' THEN 'confirmed_phishing'
+                ELSE 'legitimate' END,
+                note, '', submitted_at FROM feedback_legacy"""
+        )
+        connection.execute("DROP TABLE feedback_legacy")
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(feedback)").fetchall()}
+    if "submitted_by" not in columns:
+        connection.execute("ALTER TABLE feedback ADD COLUMN submitted_by TEXT NOT NULL DEFAULT ''")
+
+
+def _migrate_incident_schema(connection: sqlite3.Connection) -> None:
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'incidents'"
+    ).fetchone()
+    if schema is None:
+        return
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(incidents)").fetchall()
+    }
+    if "severity" not in columns:
+        connection.execute(
+            """ALTER TABLE incidents ADD COLUMN severity TEXT NOT NULL DEFAULT 'medium'
+            CHECK(severity IN ('low', 'medium', 'high', 'critical'))"""
+        )
+        connection.execute(
+            """UPDATE incidents SET severity = CASE
+                WHEN report_id IN (SELECT id FROM reports WHERE level = 'HIGH') THEN 'high'
+                WHEN report_id IN (SELECT id FROM reports WHERE level = 'LOW') THEN 'low'
+                ELSE 'medium' END"""
+        )
+    if "false_positive" in str(schema["sql"]):
+        return
+    connection.execute("ALTER TABLE incidents RENAME TO incidents_legacy")
+    connection.execute(
+        """CREATE TABLE incidents (
+            id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL UNIQUE REFERENCES reports(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('open', 'investigating', 'resolved', 'false_positive')),
+            severity TEXT NOT NULL DEFAULT 'medium' CHECK(severity IN ('low', 'medium', 'high', 'critical')),
+            assigned_to TEXT REFERENCES users(id) ON DELETE SET NULL,
+            note TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    connection.execute(
+        """INSERT INTO incidents(id, report_id, created_at, updated_at, status, severity, assigned_to, note)
+        SELECT id, report_id, created_at, updated_at, status, severity, assigned_to, note
+        FROM incidents_legacy"""
+    )
+    connection.execute("DROP TABLE incidents_legacy")
+
+
+def _load_rule_adjustments() -> dict[str, int]:
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT indicator, points_delta FROM rule_adjustments"
+        ).fetchall()
+    return {row["indicator"]: row["points_delta"] for row in rows}
+
+
+def _apply_rule_adjustments(report: dict[str, Any], adjustments: dict[str, int]) -> None:
+    if not adjustments:
+        return
+    for finding in report["findings"]:
+        delta = adjustments.get(str(finding.get("indicator", "")), 0)
+        if delta:
+            finding["points"] = max(0, int(finding["points"]) + delta)
+            finding["admin_approved_points_adjustment"] = delta
+    raw_score = sum(int(finding["points"]) for finding in report["findings"])
+    score = min(raw_score, 100)
+    report["score"] = score
+    report["level"] = "LOW" if score < 25 else "SUSPICIOUS" if score < 55 else "HIGH"
+    report["scoring"]["indicator_points_total"] = raw_score
+    report["scoring"]["score_cap_applied"] = raw_score > 100
+    report["scoring"]["method"] += " Admin-approved indicator adjustments are included."
+
+
+def _virustotal_json(path: str, api_key: str) -> tuple[int, dict[str, Any] | None]:
+    request = UrlRequest(
+        f"{VIRUSTOTAL_API_URL}{path}",
+        headers={"x-apikey": api_key, "Accept": "application/json"},
+    )
+    try:
+        with http_urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read())
+    except HTTPError as exc:
+        if exc.code == 404:
+            return 404, None
+        if exc.code == 429:
+            return 429, None
+        return exc.code, None
+    except (URLError, TimeoutError, OSError):
+        return 0, None
+    except json.JSONDecodeError:
+        return 0, None
+    if not isinstance(payload, dict):
+        return 0, None
+    return 200, payload
+
+
+def _virustotal_result(status_code: int, payload: dict[str, Any] | None) -> dict[str, Any]:
+    if status_code == 404:
+        return {"status": "not_found", "reputation": "No VirusTotal report found"}
+    if status_code == 429:
+        return {"status": "rate_limited", "reputation": "VirusTotal rate limit reached"}
+    if status_code != 200 or payload is None:
+        return {"status": "unavailable", "reputation": "VirusTotal lookup unavailable"}
+    data = payload.get("data")
+    attributes = data.get("attributes") if isinstance(data, dict) else None
+    if not isinstance(attributes, dict):
+        return {"status": "unavailable", "reputation": "VirusTotal returned no report details"}
+    raw_stats = attributes.get("last_analysis_stats")
+    stats = {
+        key: value
+        for key, value in raw_stats.items()
+        if key in {"malicious", "suspicious", "harmless", "undetected", "timeout"}
+        and isinstance(value, int)
+        and value >= 0
+    } if isinstance(raw_stats, dict) else {}
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    status = (
+        "malicious" if malicious else
+        "suspicious" if suspicious else
+        "no_detections" if stats else
+        "unknown"
+    )
+    redirects = attributes.get("redirection_chain")
+    categories = attributes.get("categories")
+    result: dict[str, Any] = {
+        "status": "found",
+        "reputation": status.replace("_", " "),
+        "detection_count": malicious + suspicious,
+        "analysis_stats": stats,
+        "categories": {
+            str(key): str(value) for key, value in list(categories.items())[:10]
+        } if isinstance(categories, dict) else {},
+    }
+    for key in ("last_final_url", "last_http_response_code", "reputation", "last_analysis_date"):
+        value = attributes.get(key)
+        if isinstance(value, (str, int)):
+            result[key] = value
+    if isinstance(redirects, list):
+        result["redirect_chain"] = [str(item) for item in redirects[:10] if isinstance(item, str)]
+    return result
+
+
+def _check_url_reputation(report: dict[str, Any], api_key: str) -> int:
+    unique_urls: set[str] = set()
+    unique_domains: set[str] = set()
+    checked_urls: dict[str, dict[str, Any]] = {}
+    checked_domains: dict[str, dict[str, Any]] = {}
+    lookups = 0
+    for item in report["urls"]:
+        destination = str(item["destination"])
+        host = str(item["host"]).casefold()
+        if destination in unique_urls:
+            item["virustotal"] = checked_urls[destination]
+            item["reputation_status"] = f"VirusTotal: {checked_urls[destination]['reputation']}"
+            continue
+        unique_urls.add(destination)
+        if len(unique_urls) > MAX_REPUTATION_LOOKUPS:
+            item["reputation_status"] = f"not checked; limit is {MAX_REPUTATION_LOOKUPS} URLs per message"
+            item["virustotal"] = {"status": "skipped", "reputation": "Per-message lookup limit reached"}
+            continue
+        url_id = base64.urlsafe_b64encode(destination.encode("utf-8")).decode("ascii").rstrip("=")
+        url_code, url_payload = _virustotal_json(f"/urls/{quote(url_id, safe='')}", api_key)
+        url_result = _virustotal_result(url_code, url_payload)
+        checked_urls[destination] = url_result
+        item["virustotal"] = url_result
+        item["reputation_status"] = f"VirusTotal: {url_result['reputation']}"
+        lookups += 1
+        if host and host != "unparsed":
+            if host not in unique_domains:
+                unique_domains.add(host)
+                domain_code, domain_payload = _virustotal_json(f"/domains/{quote(host, safe='.-')}", api_key)
+                checked_domains[host] = _virustotal_result(domain_code, domain_payload)
+                lookups += 1
+            item["virustotal"]["domain_report"] = checked_domains[host]
+    return lookups
 
 
 def _password_digest(password: str, salt: bytes) -> bytes:
@@ -442,6 +686,11 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/history":
             self._send_history()
             return
+        if path == "/api/integrations":
+            self._send_json(200, {
+                "virustotal_configured": bool(os.environ.get("VIRUSTOTAL_API_KEY", "").strip()),
+            })
+            return
         if path == "/api/trends":
             self._send_trends()
             return
@@ -471,6 +720,10 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if path == "/api/admin/settings":
             if self._authorize({"admin"}) is not None:
                 self._send_settings()
+            return
+        if path == "/api/admin/feedback":
+            if self._authorize({"admin"}) is not None:
+                self._send_feedback_reviews()
             return
         if path == "/api/admin/audit":
             if self._authorize({"admin"}) is not None:
@@ -513,7 +766,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         feedback_request = path.startswith("/api/report/") and path.endswith("/feedback")
         if path not in {
             "/preview", "/analyze", "/api/incidents", "/api/alerts/ack",
-            "/api/admin/users", "/api/admin/settings",
+            "/api/admin/users", "/api/admin/settings", "/api/admin/feedback/review",
         } and not (
             feedback_request or path.startswith("/api/incidents/")
             or path.startswith("/api/admin/users/")
@@ -523,6 +776,8 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/incidents") and self._authorize({"analyst", "admin"}) is None:
             return
         if path.startswith("/api/admin/") and self._authorize({"admin"}) is None:
+            return
+        if feedback_request and self._authorize({"analyst", "admin"}) is None:
             return
         required_field = "classification" if feedback_request else "email" if path in {"/preview", "/analyze"} else None
         payload = self._read_payload(required_field=required_field)
@@ -536,6 +791,9 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/alerts/ack":
             self._acknowledge_alert(user, payload)
+            return
+        if path == "/api/admin/feedback/review":
+            self._review_feedback(user, payload)
             return
         if path == "/api/admin/users" or path.startswith("/api/admin/users/") or path == "/api/admin/settings":
             if path == "/api/admin/users":
@@ -555,9 +813,18 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                     payload["email"],
                     header_overrides=_email_header_overrides(payload),
                 )
+                _apply_rule_adjustments(report, _load_rule_adjustments())
                 self._send_json(200, report)
             except ValueError as exc:
                 self._send_json(400, {"error": str(exc)})
+            return
+        check_reputation = payload.get("check_reputation", False)
+        if not isinstance(check_reputation, bool):
+            self._send_json(400, {"error": "check_reputation must be true or false."})
+            return
+        api_key = os.environ.get("VIRUSTOTAL_API_KEY", "").strip()
+        if check_reputation and not api_key:
+            self._send_json(503, {"error": "VirusTotal is not configured. Set VIRUSTOTAL_API_KEY and restart the app."})
             return
         try:
             report = analyze_message(
@@ -567,11 +834,18 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        _apply_rule_adjustments(report, _load_rule_adjustments())
+        if check_reputation:
+            lookup_count = _check_url_reputation(report, api_key)
+            report["integration_status"]["threat_intelligence"] = "VirusTotal checked by request"
+        else:
+            lookup_count = 0
         report["report_id"], report["analyzed_at"] = _store_report(report, user)
         _audit(user, "email.analyzed", {
             "report_id": report["report_id"],
             "level": report["level"],
             "score": report["score"],
+            "external_indicator_lookups": lookup_count,
         })
         report.pop("body", None)
         self._send_json(200, report)
@@ -651,8 +925,8 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if risk not in {"", "LOW", "SUSPICIOUS", "HIGH"}:
             self._send_json(400, {"error": "Risk filter must be LOW, SUSPICIOUS, or HIGH."})
             return
-        if status not in {"", "none", "open", "investigating", "resolved"}:
-            self._send_json(400, {"error": "Status filter must be none, open, investigating, or resolved."})
+        if status not in {"", "none", "open", "investigating", "resolved", "false_positive"}:
+            self._send_json(400, {"error": "Status filter must be none, open, investigating, resolved, or false_positive."})
             return
         if status:
             session_user, _ = self._session()
@@ -764,19 +1038,24 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                 "high": 0,
                 "suspicious": 0,
                 "low": 0,
+                "legitimate": 0,
                 "urls": 0,
             }
             for key in keys
         }
         with _database() as connection:
             rows = connection.execute(
-                f"""SELECT {group_expression} AS bucket, level, COUNT(*) AS total,
-                SUM(url_count) AS urls
-                FROM reports
+                f"""SELECT {group_expression} AS bucket, level, feedback.classification,
+                COUNT(*) AS total, SUM(url_count) AS urls
+                FROM reports LEFT JOIN feedback ON feedback.report_id = reports.id
                 WHERE date(analyzed_at) >= date(?) AND date(analyzed_at) <= date(?)
-                GROUP BY bucket, level""",
+                GROUP BY bucket, level, feedback.classification""",
                 (start_date, end_date),
             ).fetchall()
+            feedback_counts = connection.execute(
+                "SELECT classification, COUNT(*) AS total FROM feedback GROUP BY classification"
+            ).fetchall()
+            reports_with_findings = connection.execute("SELECT report_json FROM reports").fetchall()
         for row in rows:
             point = points_by_key.get(row["bucket"])
             if point is None:
@@ -787,6 +1066,16 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             level_key = row["level"].lower()
             if level_key in {"high", "suspicious", "low"}:
                 point[level_key] += count
+            if row["classification"] == "legitimate":
+                point["legitimate"] += count
+        classifications = {row["classification"]: row["total"] for row in feedback_counts}
+        indicator_counts: dict[str, int] = {}
+        for row in reports_with_findings:
+            saved_report = json.loads(row["report_json"])
+            for finding in saved_report.get("findings", []):
+                indicator = str(finding.get("indicator", "")).strip()
+                if indicator and int(finding.get("points", 0)) > 0:
+                    indicator_counts[indicator] = indicator_counts.get(indicator, 0) + 1
         points = list(points_by_key.values())
         self._send_json(200, {
             "period": period,
@@ -797,8 +1086,21 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                 "high": sum(point["high"] for point in points),
                 "suspicious": sum(point["suspicious"] for point in points),
                 "low": sum(point["low"] for point in points),
+                "legitimate": sum(point["legitimate"] for point in points),
                 "urls": sum(point["urls"] for point in points),
             },
+            "reviewed": {
+                "confirmed_phishing": classifications.get("confirmed_phishing", 0),
+                "suspicious": classifications.get("suspicious", 0),
+                "legitimate": classifications.get("legitimate", 0),
+                "false_positive": classifications.get("false_positive", 0),
+            },
+            "common_indicators": [
+                {"indicator": indicator, "count": count}
+                for indicator, count in sorted(
+                    indicator_counts.items(), key=lambda item: (-item[1], item[0].casefold())
+                )[:8]
+            ],
             "points": points,
         })
 
@@ -806,7 +1108,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         with _database() as connection:
             rows = connection.execute(
                 """SELECT incidents.id, incidents.report_id, incidents.created_at,
-                incidents.updated_at, incidents.status, incidents.note,
+                incidents.updated_at, incidents.status, incidents.severity, incidents.note,
                 incidents.assigned_to, users.username AS assignee,
                 reports.subject, reports.sender, reports.level, reports.score
                 FROM incidents
@@ -830,8 +1132,10 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                 "username": event["username"],
                 "action": event["action"],
                 "status": str(details.get("status", "")),
+                "severity": str(details.get("severity", "")),
                 "assigned_to": str(details.get("assigned_to") or ""),
                 "status_updated": bool(details.get("status_updated", False)),
+                "severity_updated": bool(details.get("severity_updated", False)),
                 "assignment_updated": bool(details.get("assignment_updated", False)),
                 "note_updated": bool(details.get("note_updated", False)),
             })
@@ -876,6 +1180,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                     "domain": host,
                     "reason": str(url_findings[0].get("indicator") or "URL pattern"),
                     "level": row["level"],
+                    "virustotal": url.get("virustotal"),
                     "subject": row["subject"] or "(No subject)",
                     "analyzed_at": row["analyzed_at"],
                 })
@@ -892,39 +1197,205 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             ).fetchall()
         self._send_json(200, {"users": [dict(row) for row in rows]})
 
+    def _send_feedback_reviews(self) -> None:
+        with _database() as connection:
+            rows = connection.execute(
+                """SELECT feedback.report_id, feedback.classification, feedback.note,
+                feedback.submitted_by, feedback.submitted_at, reports.subject,
+                reports.level, reports.score, reports.report_json,
+                users.username AS submitted_username, feedback_reviews.decision,
+                feedback_reviews.indicator, feedback_reviews.points_delta,
+                feedback_reviews.note AS review_note, feedback_reviews.reviewed_at,
+                reviewers.username AS reviewer
+                FROM feedback JOIN reports ON reports.id = feedback.report_id
+                LEFT JOIN users ON users.id = feedback.submitted_by
+                LEFT JOIN feedback_reviews ON feedback_reviews.report_id = feedback.report_id
+                LEFT JOIN users AS reviewers ON reviewers.id = feedback_reviews.reviewed_by
+                ORDER BY CASE WHEN feedback_reviews.report_id IS NULL THEN 0 ELSE 1 END,
+                    feedback.submitted_at DESC LIMIT 200"""
+            ).fetchall()
+            adjustments = connection.execute(
+                "SELECT indicator, points_delta FROM rule_adjustments ORDER BY indicator"
+            ).fetchall()
+        feedback_items = []
+        for row in rows:
+            report = json.loads(row["report_json"])
+            feedback_items.append({
+                "report_id": row["report_id"],
+                "classification": row["classification"],
+                "note": row["note"],
+                "submitted_by": row["submitted_username"] or "Former analyst",
+                "submitted_at": row["submitted_at"],
+                "subject": row["subject"] or "(No subject)",
+                "level": row["level"],
+                "score": row["score"],
+                "indicators": [
+                    {"indicator": str(finding["indicator"]), "points": int(finding["points"])}
+                    for finding in report.get("findings", [])
+                    if finding.get("indicator") and int(finding.get("points", 0)) > 0
+                ],
+                "decision": row["decision"],
+                "adjusted_indicator": row["indicator"],
+                "points_delta": row["points_delta"],
+                "review_note": row["review_note"],
+                "reviewed_at": row["reviewed_at"],
+                "reviewer": row["reviewer"],
+            })
+        self._send_json(200, {
+            "feedback": feedback_items,
+            "rule_adjustments": [dict(row) for row in adjustments],
+        })
+
+    def _review_feedback(self, actor: dict[str, str], payload: dict[str, Any]) -> None:
+        report_id = payload.get("report_id")
+        decision = payload.get("decision")
+        indicator = payload.get("indicator")
+        points_delta = payload.get("points_delta")
+        note = payload.get("note", "")
+        if not isinstance(report_id, str) or not report_id:
+            self._send_json(400, {"error": "A report_id is required."})
+            return
+        if decision not in {"approved", "rejected"}:
+            self._send_json(400, {"error": "Review decision must be approved or rejected."})
+            return
+        if not isinstance(note, str) or len(note) > 1000:
+            self._send_json(400, {"error": "Review notes must be 1000 characters or fewer."})
+            return
+        if decision == "approved" and (
+            not isinstance(indicator, str)
+            or not indicator
+            or isinstance(points_delta, bool)
+            or not isinstance(points_delta, int)
+            or points_delta == 0
+            or not -25 <= points_delta <= 25
+        ):
+            self._send_json(400, {"error": "Approval requires a matched indicator and a non-zero adjustment from -25 to 25."})
+            return
+        reviewed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with _database() as connection:
+            row = connection.execute(
+                "SELECT report_json FROM reports WHERE id = ?",
+                (report_id,),
+            ).fetchone()
+            if row is None:
+                self._send_json(404, {"error": "Report not found."})
+                return
+            feedback = connection.execute(
+                "SELECT 1 FROM feedback WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()
+            if feedback is None:
+                self._send_json(404, {"error": "Analyst feedback not found."})
+                return
+            existing_review = connection.execute(
+                "SELECT 1 FROM feedback_reviews WHERE report_id = ?",
+                (report_id,),
+            ).fetchone()
+            if existing_review is not None:
+                self._send_json(409, {"error": "This feedback has already been reviewed."})
+                return
+            if decision == "approved":
+                report = json.loads(row["report_json"])
+                matched_indicators = {
+                    str(finding.get("indicator"))
+                    for finding in report.get("findings", [])
+                    if finding.get("indicator") and int(finding.get("points", 0)) > 0
+                }
+                if indicator not in matched_indicators:
+                    self._send_json(400, {"error": "Choose a positive indicator present in this report."})
+                    return
+            connection.execute(
+                """INSERT INTO feedback_reviews(
+                    report_id, decision, reviewed_by, reviewed_at, indicator, points_delta, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    report_id,
+                    decision,
+                    actor["id"],
+                    reviewed_at,
+                    indicator if decision == "approved" else None,
+                    points_delta if decision == "approved" else None,
+                    note.strip(),
+                ),
+            )
+            if decision == "approved":
+                connection.execute(
+                    """INSERT INTO rule_adjustments(
+                        indicator, points_delta, updated_by, updated_at, source_report_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(indicator) DO UPDATE SET
+                        points_delta = excluded.points_delta,
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at,
+                        source_report_id = excluded.source_report_id""",
+                    (indicator, points_delta, actor["id"], reviewed_at, report_id),
+                )
+        _audit(actor, "feedback.reviewed", {
+            "report_id": report_id,
+            "decision": decision,
+            "indicator": indicator if decision == "approved" else None,
+            "points_delta": points_delta if decision == "approved" else None,
+        })
+        self._send_json(200, {
+            "report_id": report_id,
+            "decision": decision,
+            "indicator": indicator if decision == "approved" else None,
+            "points_delta": points_delta if decision == "approved" else None,
+            "reviewed_at": reviewed_at,
+        })
+
     def _create_incident(self, user: dict[str, str], payload: dict[str, Any]) -> None:
         report_id = payload.get("report_id")
         note = payload.get("note", "")
+        severity = payload.get("severity")
         if not isinstance(report_id, str) or not report_id:
             self._send_json(400, {"error": "A report_id is required to create an incident."})
             return
         if not isinstance(note, str) or len(note) > 1000:
             self._send_json(400, {"error": "Incident notes must be 1000 characters or fewer."})
             return
+        if severity is not None and (not isinstance(severity, str) or severity not in VALID_INCIDENT_SEVERITIES):
+            self._send_json(400, {"error": "Incident severity must be low, medium, high, or critical."})
+            return
         incident_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with _database() as connection:
-            exists = connection.execute("SELECT 1 FROM reports WHERE id = ?", (report_id,)).fetchone()
-            if exists is None:
+            report = connection.execute("SELECT level FROM reports WHERE id = ?", (report_id,)).fetchone()
+            if report is None:
                 self._send_json(404, {"error": "Report not found."})
                 return
             if connection.execute("SELECT 1 FROM incidents WHERE report_id = ?", (report_id,)).fetchone():
                 self._send_json(409, {"error": "An incident already exists for this report."})
                 return
             connection.execute(
-                """INSERT INTO incidents(id, report_id, created_at, updated_at, status, assigned_to, note)
-                VALUES (?, ?, ?, ?, 'open', ?, ?)""",
-                (incident_id, report_id, now, now, user["id"], note.strip()),
+                """INSERT INTO incidents(
+                    id, report_id, created_at, updated_at, status, severity, assigned_to, note
+                ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)""",
+                (
+                    incident_id, report_id, now, now,
+                    severity or {"HIGH": "high", "SUSPICIOUS": "medium", "LOW": "low"}[report["level"]],
+                    user["id"], note.strip(),
+                ),
             )
-        _audit(user, "incident.created", {"incident_id": incident_id, "report_id": report_id})
-        self._send_json(201, {"id": incident_id, "report_id": report_id, "status": "open"})
+        initial_severity = severity or {"HIGH": "high", "SUSPICIOUS": "medium", "LOW": "low"}[report["level"]]
+        _audit(user, "incident.created", {
+            "incident_id": incident_id, "report_id": report_id, "severity": initial_severity,
+        })
+        self._send_json(201, {
+            "id": incident_id, "report_id": report_id, "status": "open",
+            "severity": initial_severity,
+        })
 
     def _update_incident(self, user: dict[str, str], incident_id: str, payload: dict[str, Any]) -> None:
         status = payload.get("status")
+        severity = payload.get("severity")
         note = payload.get("note", "")
         assigned_to = payload.get("assigned_to", user["id"])
         if not isinstance(status, str) or status not in VALID_INCIDENT_STATUSES:
-            self._send_json(400, {"error": "Incident status must be open, investigating, or resolved."})
+            self._send_json(400, {"error": "Incident status must be open, investigating, resolved, or false_positive."})
+            return
+        if severity is not None and (not isinstance(severity, str) or severity not in VALID_INCIDENT_SEVERITIES):
+            self._send_json(400, {"error": "Incident severity must be low, medium, high, or critical."})
             return
         if not isinstance(note, str) or len(note) > 1000:
             self._send_json(400, {"error": "Incident notes must be 1000 characters or fewer."})
@@ -934,7 +1405,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             return
         with _database() as connection:
             existing = connection.execute(
-                "SELECT status, assigned_to, note FROM incidents WHERE id = ?",
+                "SELECT status, severity, assigned_to, note FROM incidents WHERE id = ?",
                 (incident_id,),
             ).fetchone()
             if existing is None:
@@ -948,20 +1419,29 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                 if assignee is None:
                     self._send_json(400, {"error": "Incident assignee must be an active analyst or administrator."})
                     return
+            next_severity = severity or existing["severity"]
             connection.execute(
-                """UPDATE incidents SET status = ?, assigned_to = ?, note = ?, updated_at = ?
+                """UPDATE incidents SET status = ?, severity = ?, assigned_to = ?, note = ?, updated_at = ?
                 WHERE id = ?""",
-                (status, assigned_to, note.strip(), datetime.now(timezone.utc).isoformat(timespec="seconds"), incident_id),
+                (
+                    status, next_severity, assigned_to, note.strip(),
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"), incident_id,
+                ),
             )
         _audit(user, "incident.updated", {
             "incident_id": incident_id,
             "status": status,
+            "severity": next_severity,
             "assigned_to": assigned_to,
             "status_updated": existing["status"] != status,
+            "severity_updated": existing["severity"] != next_severity,
             "assignment_updated": existing["assigned_to"] != assigned_to,
             "note_updated": existing["note"] != note.strip(),
         })
-        self._send_json(200, {"id": incident_id, "status": status, "assigned_to": assigned_to})
+        self._send_json(200, {
+            "id": incident_id, "status": status, "severity": next_severity,
+            "assigned_to": assigned_to,
+        })
 
     def _send_alerts(self) -> None:
         with _database() as connection:
@@ -1142,23 +1622,36 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         report.update(_report_summary(row))
         with _database() as connection:
             feedback = connection.execute(
-                "SELECT classification, note, submitted_at FROM feedback WHERE report_id = ?",
+                """SELECT feedback.classification, feedback.note, feedback.submitted_at,
+                users.username AS submitted_by
+                FROM feedback LEFT JOIN users ON users.id = feedback.submitted_by
+                WHERE feedback.report_id = ?""",
+                (report_id,),
+            ).fetchone()
+            review = connection.execute(
+                """SELECT feedback_reviews.decision, feedback_reviews.indicator,
+                feedback_reviews.points_delta, feedback_reviews.reviewed_at,
+                users.username AS reviewer
+                FROM feedback_reviews LEFT JOIN users ON users.id = feedback_reviews.reviewed_by
+                WHERE feedback_reviews.report_id = ?""",
                 (report_id,),
             ).fetchone()
         report["feedback"] = dict(feedback) if feedback else None
+        report["feedback_review"] = dict(review) if review else None
         user, _ = self._session()
         _audit(user, "report.viewed", {"report_id": report_id})
         self._send_json(200, report)
 
-    def _save_feedback(self, report_id: str, payload: dict[str, str], user: dict[str, str]) -> None:
+    def _save_feedback(self, report_id: str, payload: dict[str, Any], user: dict[str, str]) -> None:
         classification = payload.get("classification")
-        note = payload.get("note", "").strip()
-        if classification not in {"false_positive", "false_negative"}:
-            self._send_json(400, {"error": "Feedback must be false_positive or false_negative."})
+        note = payload.get("note", "")
+        if classification not in VALID_FEEDBACK_CLASSIFICATIONS:
+            self._send_json(400, {"error": "Choose confirmed_phishing, suspicious, legitimate, or false_positive."})
             return
-        if len(note) > 1000:
-            self._send_json(400, {"error": "Feedback note must be 1000 characters or fewer."})
+        if not isinstance(note, str) or not note.strip() or len(note) > 1000:
+            self._send_json(400, {"error": "A review reason of 1 to 1000 characters is required."})
             return
+        note = note.strip()
         submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with _database() as connection:
             exists = connection.execute("SELECT 1 FROM reports WHERE id = ?", (report_id,)).fetchone()
@@ -1166,13 +1659,22 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "Report not found"})
                 return
             connection.execute(
-                """INSERT INTO feedback(report_id, classification, note, submitted_at)
-                VALUES (?, ?, ?, ?)
+                """INSERT INTO feedback(report_id, classification, note, submitted_by, submitted_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(report_id) DO UPDATE SET
                     classification = excluded.classification,
                     note = excluded.note,
+                    submitted_by = excluded.submitted_by,
                     submitted_at = excluded.submitted_at""",
-                (report_id, classification, note, submitted_at),
+                (report_id, classification, note, user["id"], submitted_at),
+            )
+            connection.execute(
+                "DELETE FROM rule_adjustments WHERE source_report_id = ?",
+                (report_id,),
+            )
+            connection.execute(
+                "DELETE FROM feedback_reviews WHERE report_id = ?",
+                (report_id,),
             )
         _audit(user, "feedback.submitted", {"report_id": report_id, "classification": classification})
         self._send_json(200, {
@@ -1515,9 +2017,14 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
         add_paragraph("No authentication results were present.")
 
     add_section("URLs and destinations")
+    external_results = any(url.get("virustotal") for url in report.get("urls", []))
     add_paragraph(
-        "Destinations are displayed for review only. Links were not opened and no live "
-        "threat-intelligence reputation check was performed.",
+        "Destinations are displayed for review only. Links were not opened. "
+        + (
+            "VirusTotal results are advisory; queried indicators may be added to its public dataset."
+            if external_results else
+            "No external threat-intelligence lookup was requested."
+        ),
         size=8,
         color=(0.39, 0.46, 0.43),
         gap=3,
@@ -1530,6 +2037,23 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
             indent=5,
             width=91,
         )
+        vt_result = url.get("virustotal")
+        if isinstance(vt_result, dict):
+            add_paragraph(
+                f"VirusTotal: {vt_result.get('reputation', 'Unknown')} "
+                f"| detections: {vt_result.get('detection_count', 'not available')} "
+                f"| domain: {vt_result.get('domain_report', {}).get('reputation', 'not available')}",
+                indent=12,
+                width=85,
+            )
+            for redirect in vt_result.get("redirect_chain", []):
+                add_paragraph(f"Reported redirect: {redirect}", indent=12, width=85)
+            if vt_result.get("last_final_url"):
+                add_paragraph(
+                    f"Reported final URL: {vt_result['last_final_url']}",
+                    indent=12,
+                    width=85,
+                )
     if not urls:
         add_paragraph("No URLs were extracted.")
 

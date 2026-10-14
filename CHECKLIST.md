@@ -14,6 +14,9 @@ is malicious.
 - [ ] Use approved organizational tools and procedures for reporting, scanning,
   and reputation checks. Do not upload confidential email or attachments to
   unapproved services.
+- [ ] If VirusTotal is enabled, treat URL/domain queries as disclosure to an
+  external service; VirusTotal may add queried indicators to its public dataset.
+  Never query confidential or personal indicators without authorization.
 
 ## 2. If the evidence is a screenshot
 
@@ -171,6 +174,8 @@ program behavior; they do not establish that any particular email is safe.
 - [ ] Switch the trend dashboard between the last 30 days and last 12 months;
   verify LOW, SUSPICIOUS, and HIGH counts and URL totals match saved reports,
   including empty periods and updates after deleting a report.
+- [ ] Verify dashboard analyst-reviewed legitimate counts and common positive
+  detection indicators against saved feedback and report findings.
 - [ ] On a fresh data directory, create the initial administrator with
   `python .\web_app.py --create-admin`; verify passwords shorter than 12
   characters are rejected and the first administrator cannot be created
@@ -183,8 +188,9 @@ program behavior; they do not establish that any particular email is safe.
 - [ ] Analyze a high-score message; confirm an in-app alert is created at the
   configured score threshold and can be acknowledged.
 - [ ] As analyst/admin, create an incident from a report, assign it to an
-  active analyst, update its status/note, and confirm duplicate creation is
-  rejected.
+  active analyst, change severity and status (including False Positive), add a
+  note, and confirm the case timeline records each change and duplicate
+  creation is rejected.
 - [ ] Verify audit history records account, analysis, incident, alert,
   feedback, deletion, settings, and export events without email bodies.
 - [ ] Configure retention and verify the policy removes expired reports and
@@ -193,16 +199,29 @@ program behavior; they do not establish that any particular email is safe.
   results match filters and dashboard totals remain overall counts.
 - [ ] Download a saved report as PDF and confirm it includes score, headers,
   findings/evidence, URLs, attachments, and check limitations.
-- [ ] Mark a report false positive and false negative; confirm feedback is
-  saved, visible in history, and does not claim to retrain detection rules.
+- [ ] As analyst, classify a report as Confirmed Phishing, Suspicious,
+  Legitimate, or False Positive and provide a reason; verify ordinary users
+  cannot submit analyst feedback.
+- [ ] As administrator, review feedback and reject one item; verify no rule
+  changes. Approve a bounded adjustment for a matched indicator; verify new
+  analyses use it while saved reports retain their original score. Verify
+  feedback resubmission returns it to the review queue and rolls back its
+  prior rule adjustment when that review was its source.
+- [ ] With VirusTotal unconfigured, verify the opt-in control is unavailable
+  and a forced API request fails clearly. With an authorized API key, verify
+  URL/domain lookups require per-analysis consent, never open links, report
+  detection counts/redirects where available, cap lookups at five unique URLs,
+  and surface missing/rate-limited results without calling them safe.
 - [ ] Confirm empty input and input larger than 10 MB show clear errors.
 - [ ] Confirm analysis history stores no email body or attachment bytes.
 - [ ] Confirm the server listens only on `127.0.0.1`, and stop it with Ctrl+C.
 
-## 11. Provider-dependent integrations (not configured)
+## 11. Provider-dependent integrations (partially configured)
 
 The following external capabilities need provider selection, authorized access,
-and privacy/security review. They are not represented as working features.
+and privacy/security review. VirusTotal URL/domain lookups are implemented as
+an optional opt-in integration; remaining items are not represented as working
+features.
 
 ### Sender, header, and threat-intelligence integrations
 
@@ -210,11 +229,11 @@ and privacy/security review. They are not represented as working features.
   authentication source; do not trust unverified text in an uploaded header.
 - [ ] Expand beyond the current limited look-alike-domain heuristic; assess
   sender-domain and sending-IP reputation using an approved provider.
-- [ ] Check URLs/domains against approved threat-intelligence services and
-  detect live redirects or credential-harvesting destinations without
-  exposing email content to unapproved services.
-- [ ] Report provider, lookup time, unavailable/error states, and uncertainty;
-  never turn a failed lookup into a safe result.
+- [x] Query VirusTotal URL/domain reports only after per-analysis opt-in; show
+  available reputation counts, domain categories, redirect data, and lookup
+  failures without treating unavailable results as safe.
+- [ ] Add approved additional threat-intelligence providers and define
+  retention, service-specific sharing, and lookup-time reporting.
 
 ### Attachment scanning and response
 

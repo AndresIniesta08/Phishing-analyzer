@@ -16,6 +16,7 @@ let currentReportId = null;
 let csrfToken = null;
 let currentUser = null;
 let incidentReportIds = new Set();
+let virusTotalConfigured = false;
 
 function getEmailInput() {
   return {
@@ -215,9 +216,11 @@ function renderResult(data) {
   const feedback = data.feedback;
   const feedbackStatus = document.querySelector("#feedback-status");
   const feedbackNote = document.querySelector("#feedback-note");
+  document.querySelector("#feedback-classification").value = feedback?.classification || "confirmed_phishing";
+  document.querySelector("#submit-feedback-button").disabled = !currentReportId;
   feedbackStatus.textContent = feedback
-    ? `Marked ${feedback.classification.replace("_", " ")} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}`
-    : "Was this result incorrect? Feedback is retained for review and does not automatically retrain the rules.";
+    ? `${feedback.classification.replaceAll("_", " ")} · reviewed by ${feedback.submitted_by || "analyst"} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}${data.feedback_review ? ` · admin ${data.feedback_review.decision} the review` : " · awaiting administrator review"}`
+    : "Analysts can record a classification and reason. Feedback waits for administrator review and does not automatically tune rules.";
   feedbackStatus.classList.toggle("feedback-confirmed", Boolean(feedback));
   feedbackNote.value = feedback?.note || "";
   const pdfLink = document.querySelector("#pdf-link");
@@ -225,8 +228,37 @@ function renderResult(data) {
   pdfLink.hidden = false;
 
   const integrationNotice = document.querySelector("#integration-notice");
-  integrationNotice.textContent = `External checks not configured: AI (${data.integration_status.ai}), threat intelligence (${data.integration_status.threat_intelligence}), antivirus/sandbox (${data.integration_status.antivirus_sandbox}), Microsoft 365 (${data.integration_status.microsoft_365}). Authentication values are reported from supplied headers only.`;
+  integrationNotice.textContent = `AI (${data.integration_status.ai}); VirusTotal (${data.integration_status.threat_intelligence}); antivirus/sandbox (${data.integration_status.antivirus_sandbox}); Microsoft 365 (${data.integration_status.microsoft_365}). Authentication values are reported from supplied headers only.`;
   renderCategories(data);
+
+  const reputationList = document.querySelector("#url-reputation-list");
+  reputationList.replaceChildren();
+  if (!data.urls.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "No URLs were extracted.";
+    reputationList.append(empty);
+  }
+  for (const url of data.urls) {
+    const item = document.createElement("li");
+    const result = url.virustotal;
+    const domainReport = result?.domain_report;
+    const detectionStats = result?.analysis_stats;
+    const summary = [
+      `Domain: ${url.host}`,
+      `VirusTotal: ${result?.reputation || "not checked"}`,
+      result ? `detections: ${result.detection_count ?? "not available"}` : "",
+      detectionStats ? `engines: ${JSON.stringify(detectionStats)}` : "",
+      domainReport ? `domain reputation: ${domainReport.reputation}` : "",
+      result?.last_final_url ? `reported final URL: ${result.last_final_url}` : "",
+      result?.redirect_chain?.length ? `reported redirects: ${result.redirect_chain.join(" → ")}` : "",
+      result?.last_http_response_code ? `HTTP status: ${result.last_http_response_code}` : "",
+      result?.categories && Object.keys(result.categories).length
+        ? `categories: ${Object.entries(result.categories).map(([source, category]) => `${source}: ${category}`).join(", ")}`
+        : "",
+    ].filter(Boolean);
+    item.textContent = `${url.destination} · ${summary.join(" · ")}`;
+    reputationList.append(item);
+  }
 
   const findingsList = document.querySelector("#findings-list");
   findingsList.replaceChildren();
@@ -299,7 +331,15 @@ async function activateAccount(user, csrf) {
   document.querySelectorAll(".analyst-nav").forEach((link) => { link.hidden = !canInvestigate; });
   document.querySelectorAll(".admin-nav").forEach((link) => { link.hidden = user.role !== "admin"; });
   document.querySelector("#admin-card").hidden = user.role !== "admin";
+  document.querySelector("#feedback-panel").hidden = !canInvestigate;
+  document.querySelector("#submit-feedback-button").hidden = !canInvestigate;
   document.querySelector("#create-incident-button").hidden = !canInvestigate;
+  const integrations = await requestJson("/api/integrations");
+  virusTotalConfigured = integrations.virustotal_configured;
+  document.querySelector("#virustotal-opt-in").hidden = !virusTotalConfigured;
+  document.querySelector("#virustotal-status").textContent = virusTotalConfigured
+    ? "Configured · per-analysis opt-in"
+    : "Not configured · set VIRUSTOTAL_API_KEY";
   await loadHistory();
   await loadAlerts();
   if (canInvestigate) await loadIncidents();
@@ -322,7 +362,20 @@ async function initializeApp() {
 function renderTrends(data) {
   const summary = data.totals;
   document.querySelector("#trend-summary").textContent =
-    `${summary.emails} email${summary.emails === 1 ? "" : "s"} analyzed · ${summary.high} high risk · ${summary.suspicious} suspicious · ${summary.low} low risk · ${summary.urls} URL${summary.urls === 1 ? "" : "s"} found`;
+    `${summary.emails} email${summary.emails === 1 ? "" : "s"} analyzed · ${summary.high} high risk · ${summary.suspicious} suspicious · ${summary.low} low risk · ${summary.legitimate} reviewed as legitimate · ${summary.urls} URL${summary.urls === 1 ? "" : "s"} found`;
+  document.querySelector("#count-legitimate").textContent = data.reviewed.legitimate;
+  const indicators = document.querySelector("#common-indicators");
+  indicators.replaceChildren();
+  if (!data.common_indicators.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "No positive indicators recorded yet.";
+    indicators.append(empty);
+  }
+  for (const entry of data.common_indicators) {
+    const item = document.createElement("li");
+    item.textContent = `${entry.indicator} · ${entry.count} match${entry.count === 1 ? "" : "es"}`;
+    indicators.append(item);
+  }
   const chart = document.querySelector("#trend-chart");
   chart.replaceChildren();
   const maximum = Math.max(1, ...data.points.map((point) => point.total));
@@ -338,11 +391,14 @@ function renderTrends(data) {
     });
     column.setAttribute(
       "aria-label",
-      `${point.period}: ${point.total} analyzed, ${point.high} high risk, ${point.suspicious} suspicious, ${point.low} low risk, ${point.urls} URLs`,
+      `${point.period}: ${point.total} analyzed, ${point.high} high risk, ${point.suspicious} suspicious, ${point.low} low risk, ${point.legitimate} reviewed legitimate, ${point.urls} URLs`,
     );
     const count = document.createElement("span");
     count.className = "trend-count";
     count.textContent = point.total;
+    const legitimateCount = document.createElement("span");
+    legitimateCount.className = "trend-legitimate-count";
+    legitimateCount.textContent = `${point.legitimate} legit`;
     const bar = document.createElement("div");
     bar.className = "trend-bar";
     for (const level of ["low", "suspicious", "high"]) {
@@ -356,7 +412,7 @@ function renderTrends(data) {
     label.className = "trend-date";
     label.textContent = labelDate;
     label.title = point.period;
-    column.append(count, bar, label);
+    column.append(count, bar, legitimateCount, label);
     chart.append(column);
   }
 }
@@ -456,7 +512,7 @@ async function renderThreatDetections() {
   if (!detections.length) {
     const row = document.createElement("tr");
     const empty = document.createElement("td");
-    empty.colSpan = 5;
+    empty.colSpan = 6;
     empty.textContent = "No suspicious domains detected yet.";
     row.append(empty);
     rows.append(row);
@@ -475,6 +531,11 @@ async function renderThreatDetections() {
     badge.textContent = detection.level;
     riskCell.append(badge);
     row.append(riskCell);
+    const reputationCell = document.createElement("td");
+    reputationCell.textContent = detection.virustotal
+      ? `${detection.virustotal.reputation} · ${detection.virustotal.detection_count ?? "?"} detections`
+      : "Not checked";
+    row.append(reputationCell);
     for (const value of [detection.subject, detection.analyzed_at]) {
       const cell = document.createElement("td");
       cell.textContent = value;
@@ -563,7 +624,7 @@ async function loadIncidents() {
     const item = document.createElement("li");
     item.className = "workflow-item";
     const details = document.createElement("p");
-    details.textContent = `${incident.subject || "(No subject)"} · ${incident.level} · ${incident.status}`;
+    details.textContent = `${incident.subject || "(No subject)"} · ${incident.severity} severity · ${incident.status}`;
     const assignee = document.createElement("span");
     assignee.className = "subtle";
     assignee.textContent = `${incident.sender || "Unknown sender"} · ${incident.assignee || "Unassigned"} · Updated ${incident.updated_at}`;
@@ -589,14 +650,14 @@ async function loadIncidents() {
     const heading = document.createElement("h3");
     heading.textContent = incident.subject || "(No subject)";
     const metadata = document.createElement("p");
-    metadata.textContent = `${incident.level} · score ${incident.score} · ${incident.sender || "Unknown sender"} · Report ${incident.report_id}`;
+    metadata.textContent = `${incident.severity} severity · report risk ${incident.level} (${incident.score}) · ${incident.sender || "Unknown sender"} · Report ${incident.report_id}`;
     const controls = document.createElement("div");
     controls.className = "incident-controls";
     const statusLabel = document.createElement("label");
     statusLabel.textContent = "Status";
     const statusSelect = document.createElement("select");
     statusSelect.dataset.incidentStatus = "";
-    for (const [value, label] of [["open", "Open"], ["investigating", "Investigating"], ["resolved", "Resolved"]]) {
+    for (const [value, label] of [["open", "Open"], ["investigating", "Investigating"], ["resolved", "Resolved"], ["false_positive", "False Positive"]]) {
       const option = document.createElement("option");
       option.value = value;
       option.textContent = label;
@@ -604,6 +665,18 @@ async function loadIncidents() {
     }
     statusSelect.value = incident.status;
     statusLabel.append(statusSelect);
+    const severityLabel = document.createElement("label");
+    severityLabel.textContent = "Case severity";
+    const severitySelect = document.createElement("select");
+    severitySelect.dataset.incidentSeverity = "";
+    for (const [value, label] of [["low", "Low"], ["medium", "Medium"], ["high", "High"], ["critical", "Critical"]]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      severitySelect.append(option);
+    }
+    severitySelect.value = incident.severity;
+    severityLabel.append(severitySelect);
     const assigneeLabel = document.createElement("label");
     assigneeLabel.textContent = "Assigned analyst";
     const assigneeSelect = document.createElement("select");
@@ -639,6 +712,7 @@ async function loadIncidents() {
       const timelineEvent = document.createElement("li");
       const updateDetails = [
         event.status_updated ? `status: ${event.status}` : "",
+        event.severity_updated ? `severity: ${event.severity}` : "",
         event.assignment_updated ? "assignee updated" : "",
         event.note_updated ? "investigation notes updated" : "",
       ].filter(Boolean).join(" · ");
@@ -650,17 +724,18 @@ async function loadIncidents() {
       timelineEvent.textContent = `Incident opened ${incident.created_at}`;
       timeline.append(timelineEvent);
     }
-    controls.append(statusLabel, assigneeLabel, noteLabel, save);
+    controls.append(statusLabel, severityLabel, assigneeLabel, noteLabel, save);
     article.append(heading, metadata, timeline, controls);
     container.append(article);
   }
 }
 
 async function loadAdmin() {
-  const [usersData, settingsData, auditData] = await Promise.all([
+  const [usersData, settingsData, auditData, feedbackData] = await Promise.all([
     requestJson("/api/admin/users"),
     requestJson("/api/admin/settings"),
     requestJson("/api/admin/audit"),
+    requestJson("/api/admin/feedback"),
   ]);
   const usersRows = document.querySelector("#users-rows");
   usersRows.replaceChildren();
@@ -722,6 +797,97 @@ async function loadAdmin() {
       row.append(cell);
     }
     auditRows.append(row);
+  }
+  const reviewList = document.querySelector("#feedback-review-list");
+  reviewList.replaceChildren();
+  if (!feedbackData.feedback.length) {
+    const empty = document.createElement("p");
+    empty.className = "history-privacy";
+    empty.textContent = "No analyst feedback is awaiting review.";
+    reviewList.append(empty);
+  }
+  for (const item of feedbackData.feedback) {
+    const card = document.createElement("article");
+    card.className = "incident-item feedback-review-item";
+    card.dataset.reportId = item.report_id;
+    const heading = document.createElement("h4");
+    heading.textContent = `${item.subject} · ${item.classification.replaceAll("_", " ")}`;
+    const details = document.createElement("p");
+    details.textContent = `Risk ${item.level} (${item.score}) · ${item.submitted_by} · ${item.submitted_at}`;
+    const reason = document.createElement("p");
+    reason.textContent = `Analyst reason: ${item.note}`;
+    card.append(heading, details, reason);
+    if (item.decision) {
+      const decision = document.createElement("p");
+      decision.textContent = `Reviewed ${item.decision} by ${item.reviewer || "administrator"} on ${item.reviewed_at}${item.adjusted_indicator ? ` · ${item.adjusted_indicator} ${item.points_delta > 0 ? "+" : ""}${item.points_delta}` : ""}${item.review_note ? ` · ${item.review_note}` : ""}`;
+      card.append(decision);
+    } else {
+      const controls = document.createElement("div");
+      controls.className = "incident-controls";
+      const indicatorLabel = document.createElement("label");
+      indicatorLabel.textContent = "Matched rule to adjust";
+      const indicator = document.createElement("select");
+      indicator.dataset.reviewIndicator = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = item.indicators.length ? "Select a matched indicator" : "No positive indicator available";
+      indicator.append(placeholder);
+      for (const match of item.indicators) {
+        const option = document.createElement("option");
+        option.value = match.indicator;
+        option.textContent = `${match.indicator} (${match.points} points)`;
+        indicator.append(option);
+      }
+      indicator.disabled = item.indicators.length === 0;
+      indicatorLabel.append(indicator);
+      const deltaLabel = document.createElement("label");
+      deltaLabel.textContent = "Points adjustment for future analyses";
+      const delta = document.createElement("select");
+      delta.dataset.reviewDelta = "";
+      const deltaPlaceholder = document.createElement("option");
+      deltaPlaceholder.value = "";
+      deltaPlaceholder.textContent = "Choose adjustment";
+      delta.append(deltaPlaceholder);
+      for (const value of [-25, -10, -5, 5, 10, 25]) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = `${value > 0 ? "+" : ""}${value}`;
+        delta.append(option);
+      }
+      deltaLabel.append(delta);
+      const noteLabel = document.createElement("label");
+      noteLabel.textContent = "Administrator review note";
+      const note = document.createElement("input");
+      note.maxLength = 1000;
+      note.dataset.reviewNote = "";
+      noteLabel.append(note);
+      const approve = document.createElement("button");
+      approve.type = "button";
+      approve.className = "secondary-button";
+      approve.dataset.feedbackDecision = "approved";
+      approve.disabled = item.indicators.length === 0;
+      approve.textContent = "Approve adjustment";
+      const reject = document.createElement("button");
+      reject.type = "button";
+      reject.className = "secondary-button";
+      reject.dataset.feedbackDecision = "rejected";
+      reject.textContent = "Review; do not adjust";
+      controls.append(indicatorLabel, deltaLabel, noteLabel, approve, reject);
+      card.append(controls);
+    }
+    reviewList.append(card);
+  }
+  const ruleList = document.querySelector("#rule-adjustments-list");
+  ruleList.replaceChildren();
+  if (!feedbackData.rule_adjustments.length) {
+    const empty = document.createElement("li");
+    empty.textContent = "No approved rule adjustments.";
+    ruleList.append(empty);
+  }
+  for (const adjustment of feedbackData.rule_adjustments) {
+    const entry = document.createElement("li");
+    entry.textContent = `${adjustment.indicator}: ${adjustment.points_delta > 0 ? "+" : ""}${adjustment.points_delta} points`;
+    ruleList.append(entry);
   }
 }
 
@@ -830,6 +996,34 @@ document.querySelector("#users-rows").addEventListener("click", async (event) =>
   }
 });
 
+document.querySelector("#feedback-review-list").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLButtonElement) || !target.dataset.feedbackDecision) return;
+  const card = target.closest(".feedback-review-item");
+  const payload = {
+    report_id: card.dataset.reportId,
+    decision: target.dataset.feedbackDecision,
+    note: card.querySelector("[data-review-note]").value,
+  };
+  if (payload.decision === "approved") {
+    payload.indicator = card.querySelector("[data-review-indicator]").value;
+    payload.points_delta = Number(card.querySelector("[data-review-delta]").value);
+  }
+  clearError();
+  target.disabled = true;
+  try {
+    await requestJson("/api/admin/feedback/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    await loadAdmin();
+  } catch (error) {
+    target.disabled = false;
+    showError(error instanceof Error ? error.message : "Could not review analyst feedback.");
+  }
+});
+
 document.querySelector("#alerts-list").addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLButtonElement) || !target.dataset.ackAlert) return;
@@ -858,6 +1052,7 @@ document.querySelector("#incidents-list").addEventListener("click", async (event
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         status: card.querySelector("[data-incident-status]").value,
+        severity: card.querySelector("[data-incident-severity]").value,
         assigned_to: card.querySelector("[data-incident-assignee]").value || null,
         note: card.querySelector("[data-incident-note]").value,
       }),
@@ -941,37 +1136,42 @@ document.querySelector("#reset-history-filter").addEventListener("click", async 
   await loadHistory();
 });
 
-for (const [buttonId, classification] of [
-  ["false-positive-button", "false_positive"],
-  ["false-negative-button", "false_negative"],
-]) {
-  document.querySelector(`#${buttonId}`).addEventListener("click", async () => {
-    clearError();
-    if (!currentReportId) {
-      showError("Analyze or open a saved report before submitting feedback.");
-      return;
-    }
-    try {
-      const feedback = await requestJson(
-        `/api/report/${encodeURIComponent(currentReportId)}/feedback`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            classification,
-            note: document.querySelector("#feedback-note").value,
-          }),
-        },
-      );
-      document.querySelector("#feedback-status").textContent =
-        `Marked ${feedback.classification.replace("_", " ")} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}`;
-      document.querySelector("#feedback-status").classList.add("feedback-confirmed");
-      await loadHistory();
-    } catch (error) {
-      showError(error instanceof Error ? error.message : "Could not save feedback.");
-    }
-  });
-}
+document.querySelector("#submit-feedback-button").addEventListener("click", async () => {
+  clearError();
+  const note = document.querySelector("#feedback-note").value.trim();
+  if (!currentReportId) {
+    showError("Analyze or open a saved report before submitting analyst feedback.");
+    return;
+  }
+  if (!note) {
+    showError("Enter the evidence-based reason for this classification.");
+    return;
+  }
+  const button = document.querySelector("#submit-feedback-button");
+  button.disabled = true;
+  try {
+    const feedback = await requestJson(
+      `/api/report/${encodeURIComponent(currentReportId)}/feedback`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          classification: document.querySelector("#feedback-classification").value,
+          note,
+        }),
+      },
+    );
+    document.querySelector("#feedback-status").textContent =
+      `Recorded ${feedback.classification.replaceAll("_", " ")} by analyst on ${feedback.submitted_at}. Awaiting administrator review.`;
+    document.querySelector("#feedback-status").classList.add("feedback-confirmed");
+    await loadHistory();
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (error) {
+    showError(error instanceof Error ? error.message : "Could not save analyst feedback.");
+  } finally {
+    button.disabled = false;
+  }
+});
 
 analyzeButton.addEventListener("click", async () => {
   clearError();
@@ -989,7 +1189,10 @@ analyzeButton.addEventListener("click", async () => {
     const result = await requestJson("/analyze", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
+      body: JSON.stringify({
+        ...input,
+        check_reputation: virusTotalConfigured && document.querySelector("#check-reputation").checked,
+      }),
     });
     renderResult(result);
     await loadHistory();
@@ -1001,6 +1204,7 @@ analyzeButton.addEventListener("click", async () => {
   } finally {
     analyzeButton.disabled = false;
     analyzeButton.textContent = "Analyze and save report";
+    document.querySelector("#check-reputation").checked = false;
   }
 });
 

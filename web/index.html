@@ -49,6 +49,7 @@
         <article class="metric metric-high"><span>High risk</span><strong id="count-high">0</strong></article>
         <article class="metric metric-suspicious"><span>Suspicious</span><strong id="count-suspicious">0</strong></article>
         <article class="metric metric-low"><span>Low risk</span><strong id="count-low">0</strong></article>
+        <article class="metric metric-legitimate"><span>Reviewed legitimate</span><strong id="count-legitimate">0</strong></article>
       </section>
 
       <section id="reports-analytics" class="card severity-card" aria-labelledby="severity-title">
@@ -91,6 +92,8 @@
         <div class="trend-chart-viewport">
           <div id="trend-chart" class="trend-chart" role="list" aria-label="Email analysis counts over time"></div>
         </div>
+        <h3 class="findings-title">Common detection indicators</h3>
+        <ul id="common-indicators" class="compact-list"></ul>
       </section>
 
       <section id="alerts-card" class="card" aria-labelledby="alerts-title">
@@ -118,8 +121,8 @@
         <p class="history-privacy">Domains listed here were associated with URL indicators in analyzed messages. This is not a live threat-intelligence verdict.</p>
         <div class="table-scroll">
           <table>
-            <thead><tr><th>Domain</th><th>Detection</th><th>Risk</th><th>Message</th><th>Detected</th></tr></thead>
-            <tbody id="threat-domain-rows"><tr><td colspan="5">No suspicious domains detected yet.</td></tr></tbody>
+            <thead><tr><th>Domain</th><th>Detection</th><th>Risk</th><th>VirusTotal reputation</th><th>Message</th><th>Detected</th></tr></thead>
+            <tbody id="threat-domain-rows"><tr><td colspan="6">No suspicious domains detected yet.</td></tr></tbody>
           </table>
         </div>
       </section>
@@ -155,6 +158,11 @@
           <p class="history-privacy">When retention is enabled, expired reports and linked incidents/alerts are removed on the next analysis. Audit records are retained.</p>
           <button class="primary-button" type="submit">Save policies</button>
         </form>
+        <h3>Analyst feedback review and rule tuning</h3>
+        <p class="history-privacy">Review feedback before changes. Only an administrator-approved adjustment to a matched indicator changes future analysis scores; reviewed reports are not recalculated.</p>
+        <div id="feedback-review-list" class="incident-list"></div>
+        <h3>Active administrator-approved rule adjustments</h3>
+        <ul id="rule-adjustments-list" class="compact-list"></ul>
         <h3>Recent audit events</h3>
         <p class="history-privacy">Audit entries record account and workflow actions, not email bodies.</p>
         <div class="table-scroll"><table><thead><tr><th>Date (UTC)</th><th>User</th><th>Action</th><th>Details</th></tr></thead><tbody id="audit-rows"></tbody></table></div>
@@ -196,6 +204,10 @@
           <button id="clear-button" class="secondary-button" type="button">Clear</button>
           <span class="action-note">Links are never opened during analysis</span>
         </div>
+        <label id="virustotal-opt-in" class="external-check-option" hidden>
+          <input id="check-reputation" type="checkbox">
+          <span>Check URLs and domains with VirusTotal for this email only. VirusTotal receives these indicators and may add them to its public dataset. Email content and attachments are not sent.</span>
+        </label>
         <p id="error-message" class="error-message" role="alert" hidden></p>
       </section>
 
@@ -243,19 +255,31 @@
         <p id="report-date" class="report-date"></p>
         <div id="integration-notice" class="integration-notice"></div>
         <div id="category-results" class="category-grid"></div>
+        <section class="url-reputation-panel" aria-labelledby="url-reputation-title">
+          <h3 id="url-reputation-title">URL and domain reputation</h3>
+          <p class="history-privacy">External results are available only when the analyst opted in. Reputation data is advisory and may be incomplete.</p>
+          <ul id="url-reputation-list" class="compact-list"></ul>
+        </section>
         <h3 class="findings-title">Evidence and recommended action</h3>
         <ul id="findings-list" class="findings-list"></ul>
-        <div class="feedback-panel">
+        <div id="feedback-panel" class="feedback-panel">
           <div>
             <h3>Classification feedback</h3>
             <p id="feedback-status">Was this result incorrect? Feedback is retained for review and does not automatically retrain the rules.</p>
           </div>
-          <label class="feedback-note-label" for="feedback-note">Optional note</label>
-          <textarea id="feedback-note" class="feedback-note" maxlength="1000" placeholder="Briefly explain the correction (optional)."></textarea>
+          <label class="feedback-note-label" for="feedback-classification">Analyst classification
+            <select id="feedback-classification">
+              <option value="confirmed_phishing">Confirmed phishing</option>
+              <option value="suspicious">Suspicious</option>
+              <option value="legitimate">Legitimate</option>
+              <option value="false_positive">False positive</option>
+            </select>
+          </label>
+          <label class="feedback-note-label" for="feedback-note">Review reason (required)</label>
+          <textarea id="feedback-note" class="feedback-note" maxlength="1000" required placeholder="Record the evidence behind this analyst classification."></textarea>
           <div class="actions">
             <button id="create-incident-button" class="secondary-button feedback-button" type="button" hidden>Create incident</button>
-            <button id="false-positive-button" class="secondary-button feedback-button" type="button">Mark as false positive</button>
-            <button id="false-negative-button" class="secondary-button feedback-button" type="button">Mark as false negative</button>
+            <button id="submit-feedback-button" class="secondary-button feedback-button" type="button" hidden>Submit analyst review</button>
             <a id="pdf-link" class="file-button export-link" href="#" hidden>Download detailed PDF report</a>
           </div>
         </div>
@@ -272,7 +296,7 @@
         <form id="history-filter" class="history-filter">
           <label>Search sender or subject<input id="history-query" type="search" maxlength="200" placeholder="Search sender, subject, or domain"></label>
           <label>Risk level<select id="history-risk"><option value="">All risks</option><option value="LOW">Low risk</option><option value="SUSPICIOUS">Suspicious</option><option value="HIGH">High risk</option></select></label>
-          <label id="history-status-label" hidden>Incident status<select id="history-status"><option value="">All statuses</option><option value="none">No incident</option><option value="open">Open</option><option value="investigating">Investigating</option><option value="resolved">Resolved</option></select></label>
+          <label id="history-status-label" hidden>Incident status<select id="history-status"><option value="">All statuses</option><option value="none">No incident</option><option value="open">Open</option><option value="investigating">Investigating</option><option value="resolved">Resolved</option><option value="false_positive">False Positive</option></select></label>
           <label>From date<input id="history-from" type="date"></label>
           <label>To date<input id="history-to" type="date"></label>
           <button class="primary-button" type="submit">Search</button>
@@ -289,9 +313,9 @@
 
       <section id="integrations" class="card integrations-card" aria-labelledby="integrations-title">
         <div class="section-heading"><div><p class="eyebrow">CONNECTED SERVICES</p><h2 id="integrations-title">Integrations</h2></div></div>
-        <p class="history-privacy">Integration availability is shown transparently. No external reputation, scanning, or mailbox-remediation service is currently connected.</p>
+        <p class="history-privacy">VirusTotal is queried only when an analyst explicitly opts in for an analysis. It receives URL/domain indicators, not email bodies or attachments; VirusTotal may add queried indicators to its public dataset. Configure VIRUSTOTAL_API_KEY in the app environment and restart to enable it.</p>
         <div class="integration-grid">
-          <article><strong>Threat intelligence</strong><span>Not connected</span></article>
+          <article><strong>VirusTotal URL/domain reputation</strong><span id="virustotal-status">Checking configuration…</span></article>
           <article><strong>Antivirus and sandbox</strong><span>Not connected</span></article>
           <article><strong>Microsoft 365 / Defender</strong><span>Not connected</span></article>
           <article><strong>Notifications and quarantine</strong><span>Not connected</span></article>

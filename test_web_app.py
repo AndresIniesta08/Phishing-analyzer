@@ -10,6 +10,7 @@ from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from unittest import mock
 
 _TEST_DATA_DIR = tempfile.TemporaryDirectory()
 os.environ["PHISHING_ANALYZER_DATA_DIR"] = _TEST_DATA_DIR.name
@@ -20,6 +21,8 @@ from web_app import (
     MAX_EMAIL_BYTES,
     _build_pdf,
     _create_initial_admin,
+    _migrate_feedback_schema,
+    _migrate_incident_schema,
     _spreadsheet_safe,
 )
 
@@ -232,6 +235,7 @@ class WebAppTests(unittest.TestCase):
                 f"{self.base_url}/api/incidents/{incident_id}",
                 data=json.dumps({
                     "status": "investigating",
+                    "severity": "critical",
                     "assigned_to": analyst["id"],
                     "note": "Analyst assigned.",
                 }).encode(),
@@ -245,6 +249,7 @@ class WebAppTests(unittest.TestCase):
             case = next(item for item in cases if item["id"] == incident_id)
             self.assertEqual(case["assignee"], "test-analyst")
             self.assertEqual(case["note"], "Analyst assigned.")
+            self.assertEqual(case["severity"], "critical")
 
             settings = Request(
                 f"{self.base_url}/api/admin/settings",
@@ -514,6 +519,24 @@ class WebAppTests(unittest.TestCase):
         self.assertEqual(incident["timeline"][-1]["status"], "investigating")
         self.assertTrue(incident["timeline"][-1]["note_updated"])
 
+        false_positive_update = Request(
+            f"{self.base_url}/api/incidents/{incident_id}",
+            data=json.dumps({
+                "status": "false_positive",
+                "severity": "critical",
+                "assigned_to": "",
+                "note": "Reviewed as a false positive.",
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(false_positive_update) as response:
+            updated_incident = json.loads(response.read())
+        self.assertEqual(updated_incident["severity"], "critical")
+        with urlopen(f"{self.base_url}/api/history?status=false_positive") as response:
+            false_positive_history = json.loads(response.read())["reports"]
+        self.assertTrue(any(item["id"] == report["report_id"] for item in false_positive_history))
+
         invalid = Request(
             f"{self.base_url}/api/history?status=closed",
             headers={"Cookie": self.session_cookie},
@@ -548,6 +571,17 @@ class WebAppTests(unittest.TestCase):
             analyzed.append(report)
 
         try:
+            feedback_request = Request(
+                f"{self.base_url}/api/report/{report_ids[0]}/feedback",
+                data=json.dumps({
+                    "classification": "legitimate",
+                    "note": "Reviewed as a routine internal test message.",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(feedback_request):
+                pass
             with urlopen(f"{self.base_url}/api/trends?period=day") as response:
                 daily = json.loads(response.read())
             self.assertEqual(len(daily["points"]), 30)
@@ -558,8 +592,18 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(today_point["low"], today_before["low"] + 1)
             self.assertEqual(today_point["high"], today_before["high"] + 1)
             self.assertEqual(today_point["urls"], today_before["urls"] + 1)
+            self.assertEqual(today_point["legitimate"], today_before["legitimate"] + 1)
             self.assertEqual(daily["totals"]["emails"], daily_before["totals"]["emails"] + 2)
             self.assertEqual(daily["totals"]["urls"], daily_before["totals"]["urls"] + 1)
+            self.assertEqual(daily["totals"]["legitimate"], daily_before["totals"]["legitimate"] + 1)
+            self.assertEqual(
+                daily["reviewed"]["legitimate"],
+                daily_before["reviewed"]["legitimate"] + 1,
+            )
+            self.assertTrue(all(
+                indicator["count"] > 0
+                for indicator in daily["common_indicators"]
+            ))
 
             with urlopen(f"{self.base_url}/api/trends?period=month") as response:
                 monthly = json.loads(response.read())
@@ -568,7 +612,12 @@ class WebAppTests(unittest.TestCase):
             month_before = next(point for point in monthly_before["points"] if point["period"] == current_month)
             self.assertEqual(month_point["total"], month_before["total"] + 2)
             self.assertEqual(month_point["high"], month_before["high"] + 1)
+            self.assertEqual(month_point["legitimate"], month_before["legitimate"] + 1)
             self.assertEqual(monthly["totals"]["emails"], monthly_before["totals"]["emails"] + 2)
+            self.assertEqual(
+                monthly["reviewed"]["legitimate"],
+                monthly_before["reviewed"]["legitimate"] + 1,
+            )
 
             with self.assertRaises(HTTPError) as raised:
                 urlopen(f"{self.base_url}/api/trends?period=year")
@@ -588,10 +637,10 @@ class WebAppTests(unittest.TestCase):
         )
         with urlopen(request) as response:
             report_id = json.loads(response.read())["report_id"]
-        for classification in ("false_positive", "false_negative"):
+        for classification in ("legitimate", "suspicious", "false_positive", "confirmed_phishing"):
             feedback_request = Request(
                 f"{self.base_url}/api/report/{report_id}/feedback",
-                data=json.dumps({"classification": classification, "note": "Reviewed by local user."}).encode(),
+                data=json.dumps({"classification": classification, "note": "Reviewed by local analyst."}).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -600,11 +649,305 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(feedback["classification"], classification)
         with urlopen(f"{self.base_url}/api/report/{report_id}") as response:
             report = json.loads(response.read())
-        self.assertEqual(report["feedback"]["classification"], "false_negative")
-        self.assertEqual(report["feedback"]["note"], "Reviewed by local user.")
+        self.assertEqual(report["feedback"]["classification"], "confirmed_phishing")
+        self.assertEqual(report["feedback"]["note"], "Reviewed by local analyst.")
+        self.assertEqual(report["feedback"]["submitted_by"], "test-admin")
         delete = Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")
         with urlopen(delete):
             pass
+
+    def test_analyst_can_submit_feedback_but_cannot_review_it(self) -> None:
+        create_user = Request(
+            f"{self.base_url}/api/admin/users",
+            data=json.dumps({
+                "username": "feedback-analyst",
+                "password": "FeedbackAnalyst!2026",
+                "role": "analyst",
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(create_user) as response:
+            analyst = json.loads(response.read())
+        login = Request(
+            f"{self.base_url}/api/login",
+            data=json.dumps({
+                "username": "feedback-analyst",
+                "password": "FeedbackAnalyst!2026",
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _RAW_URLOPEN(login) as response:
+            analyst_auth = json.loads(response.read())
+            analyst_cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+        with urlopen(Request(
+            f"{self.base_url}/analyze",
+            data=json.dumps({"email": "Subject: Analyst review\n\nRoutine message."}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )) as response:
+            report_id = json.loads(response.read())["report_id"]
+
+        try:
+            feedback_request = Request(
+                f"{self.base_url}/api/report/{report_id}/feedback",
+                data=json.dumps({
+                    "classification": "suspicious",
+                    "note": "Needs a second analyst review.",
+                }).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Cookie": analyst_cookie,
+                    "X-CSRF-Token": analyst_auth["csrf_token"],
+                },
+                method="POST",
+            )
+            with _RAW_URLOPEN(feedback_request) as response:
+                self.assertEqual(json.loads(response.read())["classification"], "suspicious")
+
+            review_request = Request(
+                f"{self.base_url}/api/admin/feedback/review",
+                data=json.dumps({
+                    "report_id": report_id,
+                    "decision": "rejected",
+                    "note": "Analysts cannot administer rule changes.",
+                }).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Cookie": analyst_cookie,
+                    "X-CSRF-Token": analyst_auth["csrf_token"],
+                },
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as forbidden:
+                _RAW_URLOPEN(review_request)
+            self.assertEqual(forbidden.exception.code, 403)
+        finally:
+            with urlopen(Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")):
+                pass
+            with urlopen(Request(
+                f"{self.base_url}/api/admin/users/{analyst['id']}",
+                method="DELETE",
+            )):
+                pass
+
+    def test_feedback_approval_adjusts_future_analysis_and_resubmission_removes_it(self) -> None:
+        email = (
+            "Subject: Feedback rule review\n\n"
+            "Immediately verify your password and send OTP code; keep confidential."
+        )
+        request = Request(
+            f"{self.base_url}/analyze",
+            data=json.dumps({"email": email}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            original = json.loads(response.read())
+        report_id = original["report_id"]
+        indicator = next(
+            finding["indicator"]
+            for finding in original["findings"]
+            if finding.get("indicator") and finding.get("points", 0) > 0
+        )
+        try:
+            feedback_request = Request(
+                f"{self.base_url}/api/report/{report_id}/feedback",
+                data=json.dumps({
+                    "classification": "confirmed_phishing",
+                    "note": "Verified as credential theft.",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(feedback_request):
+                pass
+
+            review_request = Request(
+                f"{self.base_url}/api/admin/feedback/review",
+                data=json.dumps({
+                    "report_id": report_id,
+                    "decision": "approved",
+                    "indicator": indicator,
+                    "points_delta": 5,
+                    "note": "Increase this indicator's weight.",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(review_request) as response:
+                self.assertEqual(json.loads(response.read())["decision"], "approved")
+
+            with urlopen(Request(
+                f"{self.base_url}/analyze",
+                data=json.dumps({"email": email}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )) as response:
+                adjusted = json.loads(response.read())
+            adjusted_finding = next(
+                finding for finding in adjusted["findings"]
+                if finding.get("indicator") == indicator
+            )
+            original_finding = next(
+                finding for finding in original["findings"]
+                if finding.get("indicator") == indicator
+            )
+            self.assertEqual(
+                adjusted_finding["points"],
+                original_finding["points"] + 5,
+            )
+            self.assertEqual(adjusted_finding["admin_approved_points_adjustment"], 5)
+
+            update_request = Request(
+                f"{self.base_url}/api/report/{report_id}/feedback",
+                data=json.dumps({
+                    "classification": "suspicious",
+                    "note": "Review updated after additional evidence.",
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(update_request):
+                pass
+            with urlopen(f"{self.base_url}/api/admin/feedback") as response:
+                review_queue = json.loads(response.read())
+            self.assertFalse(any(
+                adjustment["indicator"] == indicator
+                for adjustment in review_queue["rule_adjustments"]
+            ))
+            self.assertIsNone(next(
+                item for item in review_queue["feedback"]
+                if item["report_id"] == report_id
+            )["decision"])
+            with urlopen(Request(
+                f"{self.base_url}/api/report/{adjusted['report_id']}",
+                method="DELETE",
+            )):
+                pass
+        finally:
+            with urlopen(Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")):
+                pass
+
+    def test_virustotal_lookups_require_opt_in_and_are_limited(self) -> None:
+        with mock.patch.dict(os.environ, {"VIRUSTOTAL_API_KEY": "test-api-key"}), \
+                mock.patch("web_app._virustotal_json") as lookup:
+            without_opt_in = Request(
+                f"{self.base_url}/analyze",
+                data=json.dumps({"email": "Subject: No lookup\n\nhttps://example.com/path"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(without_opt_in) as response:
+                unqueried = json.loads(response.read())
+            lookup.assert_not_called()
+
+            lookup.side_effect = lambda path, _api_key: (
+                200,
+                {"data": {"attributes": {
+                    "last_analysis_stats": {"malicious": 2, "suspicious": 1},
+                    "last_final_url": "https://final.example/path",
+                    "redirection_chain": ["https://start.example", "https://final.example"],
+                    "categories": {"provider": "phishing"},
+                }}},
+            )
+            email = "Subject: Lookup limit\n\n" + " ".join(
+                f"https://example{i}.com/path" for i in range(6)
+            )
+            with urlopen(Request(
+                f"{self.base_url}/analyze",
+                data=json.dumps({"email": email, "check_reputation": True}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )) as response:
+                checked = json.loads(response.read())
+
+        self.assertNotIn("virustotal", unqueried["urls"][0])
+        self.assertEqual(len(lookup.call_args_list), 10)
+        self.assertEqual(len(checked["urls"]), 6)
+        self.assertEqual(checked["urls"][0]["virustotal"]["detection_count"], 3)
+        self.assertEqual(
+            checked["urls"][0]["virustotal"]["domain_report"]["status"],
+            "found",
+        )
+        self.assertEqual(checked["urls"][0]["virustotal"]["redirect_chain"][-1], "https://final.example")
+        self.assertEqual(checked["urls"][5]["virustotal"]["status"], "skipped")
+        self.assertEqual(checked["integration_status"]["threat_intelligence"], "VirusTotal checked by request")
+        for report in (unqueried, checked):
+            with urlopen(Request(f"{self.base_url}/api/report/{report['report_id']}", method="DELETE")):
+                pass
+
+    def test_legacy_feedback_and_incident_schemas_migrate(self) -> None:
+        feedback_db = sqlite3.connect(":memory:")
+        feedback_db.row_factory = sqlite3.Row
+        feedback_db.execute("CREATE TABLE reports (id TEXT PRIMARY KEY)")
+        feedback_db.executemany(
+            "INSERT INTO reports(id) VALUES (?)",
+            (("legacy-positive",), ("legacy-negative",)),
+        )
+        feedback_db.execute(
+            """CREATE TABLE feedback (
+                report_id TEXT PRIMARY KEY REFERENCES reports(id) ON DELETE CASCADE,
+                classification TEXT NOT NULL CHECK(classification IN ('false_positive', 'false_negative')),
+                note TEXT NOT NULL DEFAULT '',
+                submitted_at TEXT NOT NULL
+            )"""
+        )
+        feedback_db.executemany(
+            "INSERT INTO feedback VALUES (?, ?, ?, ?)",
+            (
+                ("legacy-positive", "false_negative", "confirmed", "2026-01-01"),
+                ("legacy-negative", "false_positive", "benign", "2026-01-02"),
+            ),
+        )
+        _migrate_feedback_schema(feedback_db)
+        feedback_rows = {
+            row["report_id"]: row["classification"]
+            for row in feedback_db.execute("SELECT report_id, classification FROM feedback")
+        }
+        self.assertEqual(feedback_rows, {
+            "legacy-positive": "confirmed_phishing",
+            "legacy-negative": "legitimate",
+        })
+        self.assertIn(
+            "submitted_by",
+            {row["name"] for row in feedback_db.execute("PRAGMA table_info(feedback)")},
+        )
+        feedback_db.close()
+
+        incident_db = sqlite3.connect(":memory:")
+        incident_db.row_factory = sqlite3.Row
+        incident_db.execute("CREATE TABLE reports (id TEXT PRIMARY KEY, level TEXT NOT NULL)")
+        incident_db.execute("INSERT INTO reports VALUES ('legacy-report', 'HIGH')")
+        incident_db.execute("CREATE TABLE users (id TEXT PRIMARY KEY)")
+        incident_db.execute(
+            """CREATE TABLE incidents (
+                id TEXT PRIMARY KEY,
+                report_id TEXT NOT NULL UNIQUE REFERENCES reports(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('open', 'investigating', 'resolved')),
+                assigned_to TEXT REFERENCES users(id) ON DELETE SET NULL,
+                note TEXT NOT NULL DEFAULT ''
+            )"""
+        )
+        incident_db.execute(
+            "INSERT INTO incidents VALUES ('legacy-case', 'legacy-report', 'created', 'updated', 'open', NULL, 'review')"
+        )
+        _migrate_incident_schema(incident_db)
+        migrated_incident = incident_db.execute(
+            "SELECT status, severity FROM incidents WHERE id = 'legacy-case'"
+        ).fetchone()
+        self.assertEqual(migrated_incident["status"], "open")
+        self.assertEqual(migrated_incident["severity"], "high")
+        self.assertIn(
+            "false_positive",
+            incident_db.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'incidents'"
+            ).fetchone()["sql"],
+        )
+        incident_db.close()
 
     def test_pdf_download_returns_valid_pdf_structure(self) -> None:
         request = Request(
