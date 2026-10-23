@@ -1,7 +1,7 @@
 # Email Phishing Risk Analyzer
 
-A dependency-free Python desktop app and local-only localhost web app. The web
-app parses pasted email or `.eml`/`.txt` files, previews extracted details,
+A Python desktop app and local-only localhost web app. The web app parses pasted
+email or `.eml`/`.txt` files, previews extracted details,
 performs explainable offline heuristics, and saves metadata-only reports to a
 local SQLite history. It does not establish that a message is safe or malicious.
 Scores are capped at `100`: `0–24` is LOW, `25–54` is SUSPICIOUS, and `55–100`
@@ -21,14 +21,27 @@ those cases through a trusted independent channel.
 ## Requirements
 
 - Python 3.10 or later
+- For screenshot OCR: Pillow and pytesseract (installed from `requirements.txt`)
+- For screenshot OCR: the local Tesseract OCR engine
 
 ## Run the web app on Windows
 
 From PowerShell in the project directory:
 
 ```powershell
+python -m pip install -r .\requirements.txt
 python .\web_app.py
 ```
+
+Install the Tesseract executable separately for local screenshot OCR:
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR --exact
+```
+
+Restart PowerShell and the app after installation. If Tesseract is installed
+elsewhere, set `TESSERACT_CMD` to its executable path before starting the app.
+The rest of the analyzer does not require OCR to be installed.
 
 On first use, create the initial administrator from the PowerShell console;
 this cannot be done from the sign-in page:
@@ -98,6 +111,20 @@ rate-limited lookups are not treated as safe.
    can search/filter history, review reports, filter cases by status, search
    extracted domains, or export CSV/PDF.
 
+## Review a WhatsApp scam message and ZIP
+
+Open **WhatsApp Scam Review**, paste the suspicious chat, and optionally select
+the downloaded `.zip` file (maximum 10 MB). The review reuses local text and
+URL heuristics and inspects only the ZIP directory metadata: listed filenames,
+declared sizes, encrypted-entry flags, suspicious file extensions, unsafe
+paths, and the ZIP's SHA-256. Archives are limited to 1,000 entries.
+
+The app does not extract or run archive contents, read files inside the ZIP,
+upload the ZIP to a provider, or perform an antivirus scan. A LOW score or
+ordinary-looking file list is not proof the archive is safe. Do not open or
+extract unexpected downloads; scan them with your organization's approved
+antivirus/security tools and report suspicious messages.
+
 The sidebar links to the overview, analysis workspace, threat detections,
 investigations, history, analytics, integrations, user management, and settings.
 Administrator-only and analyst-only entries are role-gated. Domains shown under
@@ -129,13 +156,22 @@ Attachment bytes are never opened or executed. The app calculates SHA-256
 locally and flags risky filename extensions; it does not scan files. Supplied
 SPF/DKIM/DMARC header values are displayed but not independently verified.
 Links are extracted but never opened. VirusTotal checks require an API key and
-per-analysis opt-in. Screenshot files are unsupported: inspect screenshots
-manually and paste a faithful transcription of their visible text.
+per-analysis opt-in. In **Screenshot Review**, choose a PNG, JPEG, WebP, or BMP
+image up to 5 MB and 16 megapixels. Tesseract performs OCR locally in memory;
+the image is not saved or sent to an external service. Inspect and correct the
+editable OCR text against the screenshot before analyzing it. OCR is English
+only and may miss or misread content. It does not inspect layout, logos, QR
+codes, or actual link destinations. The saved report retains the screenshot
+filename, extracted URLs, and may retain matching evidence snippets, but not
+the screenshot or full OCR text.
 
 Saved history is under `%LOCALAPPDATA%\EmailPhishingRiskAnalyzer\history.sqlite3`
 on Windows. It stores report metadata (including sender, subject, findings,
-URLs, attachment names/hashes, and user feedback) but not the email body or
-attachment bytes. Delete individual reports in the UI. VirusTotal is optional;
+URLs, attachment names/hashes, screenshot filenames, ZIP directory names, and
+user feedback) but not message bodies or attachment bytes. Delete individual
+reports in the UI.
+WhatsApp chat reports retain matching evidence snippets as part of their
+findings. VirusTotal is optional;
 AI, antivirus/sandbox, Microsoft 365/Defender, external notifications, and
 quarantine integrations are not configured. AI analysis requires an explicitly
 approved model/provider and privacy review. Microsoft Graph/Defender and

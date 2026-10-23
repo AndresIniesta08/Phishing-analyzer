@@ -10,6 +10,13 @@ const analyzeButton = document.querySelector("#analyze-button");
 const errorMessage = document.querySelector("#error-message");
 const previewCard = document.querySelector("#preview-card");
 const resultCard = document.querySelector("#result-card");
+const whatsappReviewForm = document.querySelector("#whatsapp-review-form");
+const whatsappMessageInput = document.querySelector("#whatsapp-message");
+const whatsappZipInput = document.querySelector("#whatsapp-zip");
+const screenshotFileInput = document.querySelector("#screenshot-file");
+const screenshotOcrText = document.querySelector("#screenshot-ocr-text");
+let screenshotPreviewUrl = null;
+let screenshotFilename = "";
 
 let previewedInput = null;
 let currentReportId = null;
@@ -53,6 +60,76 @@ function showError(message) {
 function clearError() {
   errorMessage.textContent = "";
   errorMessage.hidden = true;
+}
+
+function toBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function renderWhatsappReview(report) {
+  const result = document.querySelector("#whatsapp-review-result");
+  result.hidden = false;
+  const banner = document.querySelector("#whatsapp-risk-banner");
+  banner.className = `risk-banner risk-${String(report.level).toLowerCase()}`;
+  document.querySelector("#whatsapp-risk-level").textContent = `${report.level} risk indicators`;
+  document.querySelector("#whatsapp-risk-score").textContent = report.score;
+  document.querySelector("#whatsapp-report-id").textContent = `Report ${report.report_id}`;
+  document.querySelector("#whatsapp-review-disclaimer").textContent =
+    "A low score does not mean the message or ZIP is safe. This review does not scan file contents or replace antivirus tools.";
+
+  const findings = document.querySelector("#whatsapp-findings");
+  findings.replaceChildren();
+  for (const finding of report.findings) {
+    const item = document.createElement("li");
+    const details = document.createElement("span");
+    details.textContent = `${finding.indicator || finding.category}: ${finding.reason}`;
+    const evidence = document.createElement("span");
+    evidence.className = "finding-evidence";
+    evidence.textContent = `Evidence: ${finding.evidence}`;
+    const points = document.createElement("span");
+    points.className = "finding-points";
+    points.textContent = finding.points > 0 ? `+${finding.points} points` : "Informational";
+    item.append(details, evidence, points);
+    findings.append(item);
+  }
+
+  function resetScreenshotPreview() {
+    if (screenshotPreviewUrl) {
+      URL.revokeObjectURL(screenshotPreviewUrl);
+      screenshotPreviewUrl = null;
+    }
+    document.querySelector("#screenshot-preview").removeAttribute("src");
+    document.querySelector("#screenshot-preview").hidden = true;
+  }
+
+  const archive = report.zip_inspection;
+  const archiveResult = document.querySelector("#whatsapp-archive-result");
+  archiveResult.hidden = !archive;
+  if (archive) {
+    document.querySelector("#whatsapp-archive-summary").textContent =
+      `${archive.filename} · ${archive.entry_count} entries · ${archive.size_bytes.toLocaleString()} bytes · ${archive.declared_uncompressed_bytes.toLocaleString()} declared uncompressed bytes · ${archive.encrypted_entry_count} encrypted · ${archive.nested_archive_count} nested archive(s) · ${archive.scan_status}`;
+    document.querySelector("#whatsapp-archive-hash").textContent = `ZIP SHA-256: ${archive.sha256}`;
+    const entries = document.querySelector("#whatsapp-archive-entries");
+    entries.replaceChildren();
+    const visibleEntries = archive.listed_entries.length
+      ? archive.listed_entries
+      : ["No entries listed in the ZIP directory."];
+    for (const entryName of visibleEntries) {
+      const item = document.createElement("li");
+      item.textContent = entryName;
+      entries.append(item);
+    }
+    if (archive.listing_truncated) {
+      const item = document.createElement("li");
+      item.textContent = "Listing truncated; not all names are shown.";
+      entries.append(item);
+    }
+  }
 }
 
 function addField(container, label, value) {
@@ -211,8 +288,9 @@ function renderResult(data) {
   document.querySelector("#language-explanation").textContent = language
     ? `Language rules: ${language.supported_languages.join(", ")}. Matched: ${language.matched_languages.length ? language.matched_languages.join(", ") : "no non-English phrase rules"}. ${language.method}`
     : "Language detection is limited to the configured rule set.";
+  const reportSource = data.channel ? `${data.channel} · ` : "";
   document.querySelector("#report-date").textContent =
-    `Report ${data.report_id || data.id || ""} · ${data.analyzed_at || ""}`;
+    `${reportSource}Report ${data.report_id || data.id || ""} · ${data.analyzed_at || ""}`;
   const feedback = data.feedback;
   const feedbackStatus = document.querySelector("#feedback-status");
   const feedbackNote = document.querySelector("#feedback-note");
@@ -228,7 +306,10 @@ function renderResult(data) {
   pdfLink.hidden = false;
 
   const integrationNotice = document.querySelector("#integration-notice");
-  integrationNotice.textContent = `AI (${data.integration_status.ai}); VirusTotal (${data.integration_status.threat_intelligence}); antivirus/sandbox (${data.integration_status.antivirus_sandbox}); Microsoft 365 (${data.integration_status.microsoft_365}). Authentication values are reported from supplied headers only.`;
+  const screenshotNotice = data.screenshot_review
+    ? ` ${data.screenshot_review.processing}. OCR may be inaccurate; verify links and visual clues against the original screenshot.`
+    : "";
+  integrationNotice.textContent = `AI (${data.integration_status.ai}); VirusTotal (${data.integration_status.threat_intelligence}); antivirus/sandbox (${data.integration_status.antivirus_sandbox}); Microsoft 365 (${data.integration_status.microsoft_365}). Authentication values are reported from supplied headers only.${screenshotNotice}`;
   renderCategories(data);
 
   const reputationList = document.querySelector("#url-reputation-list");
@@ -362,7 +443,7 @@ async function initializeApp() {
 function renderTrends(data) {
   const summary = data.totals;
   document.querySelector("#trend-summary").textContent =
-    `${summary.emails} email${summary.emails === 1 ? "" : "s"} analyzed · ${summary.high} high risk · ${summary.suspicious} suspicious · ${summary.low} low risk · ${summary.legitimate} reviewed as legitimate · ${summary.urls} URL${summary.urls === 1 ? "" : "s"} found`;
+    `${summary.messages} message${summary.messages === 1 ? "" : "s"} analyzed · ${summary.high} high risk · ${summary.suspicious} suspicious · ${summary.low} low risk · ${summary.legitimate} reviewed as legitimate · ${summary.urls} URL${summary.urls === 1 ? "" : "s"} found`;
   document.querySelector("#count-legitimate").textContent = data.reviewed.legitimate;
   const indicators = document.querySelector("#common-indicators");
   indicators.replaceChildren();
@@ -415,6 +496,8 @@ function renderTrends(data) {
     column.append(count, bar, legitimateCount, label);
     chart.append(column);
   }
+  const viewport = document.querySelector(".trend-chart-viewport");
+  viewport.scrollLeft = viewport.scrollWidth;
 }
 
 async function loadTrends() {
@@ -555,8 +638,8 @@ function renderSeverityDistribution(counts) {
   const summary = document.querySelector("#severity-summary");
   const bar = document.querySelector("#severity-bar");
   summary.textContent = total === 0
-    ? "No email reports analyzed yet."
-    : `${total} saved report${total === 1 ? "" : "s"} · ${counts.high} high · ${counts.suspicious} suspicious · ${counts.low} low`;
+    ? "No reports analyzed yet."
+    : `${total} saved analysis report${total === 1 ? "" : "s"} · ${counts.high} high · ${counts.suspicious} suspicious · ${counts.low} low`;
   bar.setAttribute(
     "aria-label",
     total === 0
@@ -1311,6 +1394,220 @@ document.querySelector("#clear-button").addEventListener("click", () => {
   resultCard.hidden = true;
   document.querySelector("#analysis-guidance").hidden = false;
   clearError();
+});
+
+whatsappZipInput.addEventListener("change", () => {
+  const error = document.querySelector("#whatsapp-review-error");
+  error.hidden = true;
+  const file = whatsappZipInput.files?.[0];
+  if (!file) {
+    document.querySelector("#whatsapp-zip-name").textContent = "No ZIP selected.";
+    return;
+  }
+  if (!file.name.toLowerCase().endsWith(".zip")) {
+    whatsappZipInput.value = "";
+    document.querySelector("#whatsapp-zip-name").textContent = "No ZIP selected.";
+    error.textContent = "Choose a .zip archive.";
+    error.hidden = false;
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    whatsappZipInput.value = "";
+    document.querySelector("#whatsapp-zip-name").textContent = "No ZIP selected.";
+    error.textContent = "ZIP files must be 10 MB or smaller.";
+    error.hidden = false;
+    return;
+  }
+  document.querySelector("#whatsapp-zip-name").textContent =
+    `Selected: ${file.name} (${file.size.toLocaleString()} bytes)`;
+});
+
+whatsappReviewForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const error = document.querySelector("#whatsapp-review-error");
+  error.hidden = true;
+  const message = whatsappMessageInput.value;
+  if (!message.trim()) {
+    error.textContent = "Paste the suspicious WhatsApp message before reviewing.";
+    error.hidden = false;
+    return;
+  }
+  if (new TextEncoder().encode(message).length > 100 * 1024) {
+    error.textContent = "WhatsApp message text must be 100 KB or smaller.";
+    error.hidden = false;
+    return;
+  }
+
+  const button = document.querySelector("#whatsapp-review-button");
+  button.disabled = true;
+  button.textContent = "Reviewing safely…";
+  try {
+    const zipFile = whatsappZipInput.files?.[0];
+    const payload = { message, zip_filename: "", zip_base64: "" };
+    if (zipFile) {
+      payload.zip_filename = zipFile.name;
+      payload.zip_base64 = toBase64(new Uint8Array(await zipFile.arrayBuffer()));
+    }
+    const report = await requestJson("/api/whatsapp/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    renderWhatsappReview(report);
+    try {
+      await loadHistory();
+      await loadAlerts();
+    } catch (refreshError) {
+      error.textContent = `Review saved, but dashboard data could not refresh: ${refreshError instanceof Error ? refreshError.message : "unknown error"}`;
+      error.hidden = false;
+    }
+  } catch (reviewError) {
+    error.textContent = reviewError instanceof Error ? reviewError.message : "Could not review this WhatsApp message.";
+    error.hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Review message and ZIP";
+  }
+});
+
+document.querySelector("#whatsapp-clear-button").addEventListener("click", () => {
+  whatsappReviewForm.reset();
+  document.querySelector("#whatsapp-zip-name").textContent = "No ZIP selected.";
+  document.querySelector("#whatsapp-review-result").hidden = true;
+  document.querySelector("#whatsapp-review-error").hidden = true;
+});
+
+screenshotFileInput.addEventListener("change", () => {
+  const error = document.querySelector("#screenshot-ocr-error");
+  error.hidden = true;
+  document.querySelector("#screenshot-analyze-error").hidden = true;
+  document.querySelector("#screenshot-text-review").hidden = true;
+  document.querySelector("#screenshot-analyze-button").disabled = true;
+  screenshotOcrText.value = "";
+  screenshotFilename = "";
+  resetScreenshotPreview();
+  const file = screenshotFileInput.files?.[0];
+  if (!file) {
+    document.querySelector("#screenshot-file-name").textContent = "No screenshot selected.";
+    document.querySelector("#screenshot-ocr-button").disabled = true;
+    return;
+  }
+  const allowedTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/bmp"]);
+  const allowedExtensions = /\.(png|jpe?g|webp|bmp)$/i;
+  if (!allowedExtensions.test(file.name) || (file.type && !allowedTypes.has(file.type))) {
+    screenshotFileInput.value = "";
+    document.querySelector("#screenshot-file-name").textContent = "No screenshot selected.";
+    document.querySelector("#screenshot-ocr-button").disabled = true;
+    error.textContent = "Choose a PNG, JPEG, WebP, or BMP screenshot.";
+    error.hidden = false;
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    screenshotFileInput.value = "";
+    document.querySelector("#screenshot-file-name").textContent = "No screenshot selected.";
+    document.querySelector("#screenshot-ocr-button").disabled = true;
+    error.textContent = "Screenshot images must be 5 MB or smaller.";
+    error.hidden = false;
+    return;
+  }
+  screenshotFilename = file.name;
+  document.querySelector("#screenshot-file-name").textContent =
+    `Selected: ${file.name} (${file.size.toLocaleString()} bytes)`;
+  screenshotPreviewUrl = URL.createObjectURL(file);
+  const preview = document.querySelector("#screenshot-preview");
+  preview.src = screenshotPreviewUrl;
+  preview.hidden = false;
+  document.querySelector("#screenshot-ocr-button").disabled = false;
+});
+
+document.querySelector("#screenshot-ocr-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const error = document.querySelector("#screenshot-ocr-error");
+  error.hidden = true;
+  const file = screenshotFileInput.files?.[0];
+  if (!file) {
+    error.textContent = "Choose a screenshot before extracting text.";
+    error.hidden = false;
+    return;
+  }
+  const button = document.querySelector("#screenshot-ocr-button");
+  button.disabled = true;
+  button.textContent = "Extracting locally…";
+  try {
+    const imageBytes = new Uint8Array(await file.arrayBuffer());
+    const ocr = await requestJson("/api/screenshot/ocr", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: file.name, image_base64: toBase64(imageBytes) }),
+    });
+    screenshotFilename = ocr.filename;
+    screenshotOcrText.value = ocr.text;
+    document.querySelector("#screenshot-ocr-summary").textContent =
+      `${ocr.format} · ${ocr.width} × ${ocr.height} pixels · ${ocr.word_count} words · average OCR confidence ${ocr.confidence === null ? "unavailable" : `${ocr.confidence}%`}. Confidence is approximate, not a safety score.`;
+    document.querySelector("#screenshot-text-review").hidden = false;
+    document.querySelector("#screenshot-analyze-button").disabled = !ocr.text.trim();
+  } catch (ocrError) {
+    error.textContent = ocrError instanceof Error ? ocrError.message : "Local OCR could not process this screenshot.";
+    error.hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = "Extract text locally";
+  }
+});
+
+screenshotOcrText.addEventListener("input", () => {
+  document.querySelector("#screenshot-analyze-button").disabled = !screenshotOcrText.value.trim();
+  document.querySelector("#screenshot-analyze-error").hidden = true;
+});
+
+document.querySelector("#screenshot-analyze-button").addEventListener("click", async () => {
+  const error = document.querySelector("#screenshot-analyze-error");
+  error.hidden = true;
+  const text = screenshotOcrText.value;
+  if (!text.trim()) {
+    error.textContent = "Review or enter the screenshot text before analyzing it.";
+    error.hidden = false;
+    return;
+  }
+  if (new TextEncoder().encode(text).length > 100 * 1024) {
+    error.textContent = "Screenshot text must be 100 KB or smaller.";
+    error.hidden = false;
+    return;
+  }
+  const button = document.querySelector("#screenshot-analyze-button");
+  button.disabled = true;
+  button.textContent = "Analyzing reviewed text…";
+  try {
+    const report = await requestJson("/api/screenshot/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename: screenshotFilename, text }),
+    });
+    renderResult(report);
+    await loadHistory();
+    await loadAlerts();
+    if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
+    if (currentUser?.role === "admin") await loadAdmin();
+  } catch (analysisError) {
+    error.textContent = analysisError instanceof Error ? analysisError.message : "Could not analyze the reviewed screenshot text.";
+    error.hidden = false;
+  } finally {
+    button.disabled = !screenshotOcrText.value.trim();
+    button.textContent = "Analyze reviewed text";
+  }
+});
+
+document.querySelector("#screenshot-clear-button").addEventListener("click", () => {
+  screenshotFileInput.value = "";
+  screenshotFilename = "";
+  screenshotOcrText.value = "";
+  document.querySelector("#screenshot-file-name").textContent = "No screenshot selected.";
+  document.querySelector("#screenshot-ocr-button").disabled = true;
+  document.querySelector("#screenshot-analyze-button").disabled = true;
+  document.querySelector("#screenshot-text-review").hidden = true;
+  document.querySelector("#screenshot-ocr-error").hidden = true;
+  document.querySelector("#screenshot-analyze-error").hidden = true;
+  resetScreenshotPreview();
 });
 
 initializeApp();

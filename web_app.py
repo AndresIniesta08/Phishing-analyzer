@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 from contextlib import contextmanager
 from collections.abc import Iterator
@@ -16,8 +17,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import uuid
+import zipfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request as UrlRequest, urlopen as http_urlopen
@@ -27,11 +30,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from email_analysis import analyze_message
+from email_analysis import DANGEROUS_EXTENSIONS, analyze_message
 
 
 WEB_DIR = Path(__file__).with_name("web")
 MAX_EMAIL_BYTES = 10 * 1024 * 1024
+MAX_WHATSAPP_ZIP_BYTES = 10 * 1024 * 1024
+MAX_WHATSAPP_MESSAGE_BYTES = 100 * 1024
+MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024
+MAX_SCREENSHOT_PIXELS = 16_000_000
+MAX_SCREENSHOT_TEXT_BYTES = 100 * 1024
+SCREENSHOT_OCR_TIMEOUT_SECONDS = 20
+MAX_SCREENSHOT_REQUEST_BYTES = (MAX_SCREENSHOT_BYTES + 2) // 3 * 4 + 16 * 1024
+MAX_WHATSAPP_REQUEST_BYTES = (
+    (MAX_WHATSAPP_ZIP_BYTES + 2) // 3 * 4
+    + MAX_WHATSAPP_MESSAGE_BYTES * 6
+    + 8192
+)
+MAX_WHATSAPP_ZIP_ENTRIES = 1000
+MAX_WHATSAPP_ZIP_LISTING = 100
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 HISTORY_LIMIT = 100
 SESSION_COOKIE = "phishing_session"
@@ -45,6 +62,19 @@ VALID_FEEDBACK_CLASSIFICATIONS = {
 }
 MAX_REPUTATION_LOOKUPS = 5
 VIRUSTOTAL_API_URL = "https://www.virustotal.com/api/v3"
+WHATSAPP_DANGEROUS_EXTENSIONS = DANGEROUS_EXTENSIONS | {
+    ".apk", ".apks", ".xapk",
+}
+NESTED_ARCHIVE_EXTENSIONS = {".7z", ".gz", ".rar", ".tar", ".zip"}
+SCREENSHOT_FORMATS = {"PNG", "JPEG", "WEBP", "BMP"}
+
+
+class OcrUnavailableError(RuntimeError):
+    """Raised when the local Tesseract OCR engine is unavailable."""
+
+
+class OcrTimeoutError(RuntimeError):
+    """Raised when local OCR exceeds its time limit."""
 
 
 def _default_data_dir() -> Path:
@@ -288,6 +318,281 @@ def _apply_rule_adjustments(report: dict[str, Any], adjustments: dict[str, int])
     report["scoring"]["method"] += " Admin-approved indicator adjustments are included."
 
 
+def _inspect_whatsapp_zip(encoded: str, filename: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    safe_filename = "".join(
+        character
+        for character in filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if ord(character) >= 32 and ord(character) != 127
+    )
+    if not safe_filename or len(safe_filename) > 255 or not safe_filename.casefold().endswith(".zip"):
+        raise ValueError("Choose a ZIP file with a valid .zip filename.")
+    try:
+        archive_bytes = base64.b64decode(encoded, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("The ZIP upload was not valid base64 data.") from exc
+    if not archive_bytes:
+        raise ValueError("The ZIP file is empty.")
+    if len(archive_bytes) > MAX_WHATSAPP_ZIP_BYTES:
+        raise ValueError("ZIP files must be 10 MB or smaller.")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            entries = archive.infolist()
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ValueError) as exc:
+        raise ValueError("The selected file is not a readable ZIP archive. Nothing was extracted.") from exc
+    if len(entries) > MAX_WHATSAPP_ZIP_ENTRIES:
+        raise ValueError(f"ZIP archives with more than {MAX_WHATSAPP_ZIP_ENTRIES} entries are not accepted.")
+
+    listed_entries: list[str] = []
+    risky_entries: list[str] = []
+    nested_archive_count = 0
+    encrypted_count = 0
+    unsafe_path_count = 0
+    declared_uncompressed_bytes = 0
+    high_compression_ratio_count = 0
+    findings: list[dict[str, Any]] = []
+
+    for entry in entries:
+        normalized_name = entry.filename.replace("\\", "/")
+        parts = normalized_name.split("/")
+        path_is_unsafe = (
+            normalized_name.startswith("/")
+            or any(part == ".." for part in parts)
+            or (len(normalized_name) >= 2 and normalized_name[1] == ":")
+        )
+        if path_is_unsafe:
+            unsafe_path_count += 1
+
+        display_name = "".join(
+            character for character in normalized_name
+            if ord(character) >= 32 and ord(character) != 127
+        )[:255]
+        suffixes = [suffix.casefold() for suffix in Path(normalized_name).suffixes]
+        if any(suffix in WHATSAPP_DANGEROUS_EXTENSIONS for suffix in suffixes):
+            risky_entries.append(display_name)
+        if suffixes and suffixes[-1] in NESTED_ARCHIVE_EXTENSIONS:
+            nested_archive_count += 1
+        if entry.flag_bits & 1:
+            encrypted_count += 1
+        declared_uncompressed_bytes += max(0, entry.file_size)
+        if (
+            entry.file_size >= 1024 * 1024
+            and entry.compress_size > 0
+            and entry.file_size / entry.compress_size > 100
+        ):
+            high_compression_ratio_count += 1
+
+        if len(listed_entries) < MAX_WHATSAPP_ZIP_LISTING:
+            listed_entries.append(display_name)
+
+    if risky_entries:
+        findings.append({
+            "category": "attachments",
+            "points": min(25 + (len(risky_entries) - 1) * 5, 40),
+            "indicator": "Potentially executable archive contents",
+            "reason": "The ZIP directory lists file types that can run code or install apps; this is a warning, not proof of malware.",
+            "evidence": ", ".join(risky_entries[:10]),
+        })
+    if unsafe_path_count:
+        findings.append({
+            "category": "attachments",
+            "points": 25,
+            "indicator": "Unsafe archive paths",
+            "reason": "The ZIP directory contains absolute or parent-directory paths that can be dangerous when extracted.",
+            "evidence": f"{unsafe_path_count} unsafe path(s) found in archive metadata.",
+        })
+    if encrypted_count:
+        findings.append({
+            "category": "attachments",
+            "points": 8,
+            "indicator": "Encrypted archive entries",
+            "reason": "Some ZIP entries are encrypted, so their contents could not be inspected.",
+            "evidence": f"{encrypted_count} encrypted entry/entries; content was not opened.",
+        })
+    if high_compression_ratio_count:
+        findings.append({
+            "category": "attachments",
+            "points": 12,
+            "indicator": "Unusually high ZIP compression ratio",
+            "reason": "Some entries declare unusually high expansion ratios; the app did not decompress them.",
+            "evidence": f"{high_compression_ratio_count} entry/entries exceed a 100:1 declared ratio.",
+        })
+    if nested_archive_count:
+        findings.append({
+            "category": "attachments",
+            "points": 0,
+            "indicator": "Nested archives present",
+            "reason": "Nested archives are not opened or inspected by this check.",
+            "evidence": f"{nested_archive_count} nested archive(s) listed.",
+        })
+
+    return {
+        "filename": safe_filename,
+        "size_bytes": len(archive_bytes),
+        "sha256": hashlib.sha256(archive_bytes).hexdigest(),
+        "scan_status": "ZIP directory metadata only; contents not extracted or antivirus-scanned",
+        "entry_count": len(entries),
+        "listed_entries": listed_entries,
+        "listing_truncated": len(entries) > len(listed_entries),
+        "risky_entries": risky_entries[:MAX_WHATSAPP_ZIP_LISTING],
+        "nested_archive_count": nested_archive_count,
+        "encrypted_entry_count": encrypted_count,
+        "unsafe_path_count": unsafe_path_count,
+        "declared_uncompressed_bytes": declared_uncompressed_bytes,
+        "high_compression_ratio_count": high_compression_ratio_count,
+    }, findings
+
+
+def _analyze_whatsapp_message(
+    message_text: str,
+    zip_inspection: dict[str, Any] | None,
+    archive_findings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    report = analyze_message(f"Subject: WhatsApp scam review\n\n{message_text}")
+    report["channel"] = "WhatsApp"
+    report["subject"] = "WhatsApp scam review"
+    report["sender"] = [{"name": "WhatsApp conversation", "address": ""}]
+    if zip_inspection is not None:
+        report["zip_inspection"] = zip_inspection
+        report["attachments"] = [{
+            "filename": zip_inspection["filename"],
+            "content_type": "application/zip",
+            "size_bytes": zip_inspection["size_bytes"],
+            "sha256": zip_inspection["sha256"],
+            "scan_status": zip_inspection["scan_status"],
+            "suspicious": bool(zip_inspection["risky_entries"] or zip_inspection["unsafe_path_count"]),
+            "zip_inspection": zip_inspection,
+        }]
+    else:
+        report["zip_inspection"] = None
+
+    report["findings"].extend(archive_findings or [])
+    raw_score = sum(int(finding["points"]) for finding in report["findings"])
+    score = min(raw_score, 100)
+    report["score"] = score
+    report["level"] = "LOW" if score < 25 else "SUSPICIOUS" if score < 55 else "HIGH"
+    report["scoring"]["indicator_points_total"] = raw_score
+    report["scoring"]["score_cap_applied"] = raw_score > 100
+    report["scoring"]["method"] += " WhatsApp text checks and ZIP directory metadata are included; archive contents were not scanned."
+    report["confidence_note"] = (
+        "This is a heuristic review, not a malware verdict. ZIP metadata cannot reveal malicious behavior "
+        "inside files; do not extract or run an unexpected archive."
+    )
+    return report
+
+
+def _ocr_screenshot(image_bytes: bytes) -> dict[str, Any]:
+    try:
+        from PIL import Image, UnidentifiedImageError
+        import pytesseract
+        from pytesseract import Output
+    except ImportError as exc:
+        raise OcrUnavailableError(
+            "Local OCR support is missing. Install the project requirements and restart the app."
+        ) from exc
+
+    if not image_bytes:
+        raise ValueError("Choose a non-empty screenshot image.")
+    if len(image_bytes) > MAX_SCREENSHOT_BYTES:
+        raise ValueError("Screenshot images must be 5 MB or smaller.")
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image_format = str(image.format or "").upper()
+            if image_format not in SCREENSHOT_FORMATS:
+                raise ValueError("Use a PNG, JPEG, WebP, or BMP screenshot.")
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_SCREENSHOT_PIXELS:
+                raise ValueError("Screenshot dimensions must not exceed 16 megapixels.")
+            if getattr(image, "is_animated", False):
+                raise ValueError("Animated images are not supported; choose a still screenshot.")
+            image.load()
+            rgb_image = image.convert("RGB")
+    except UnidentifiedImageError as exc:
+        raise ValueError("The uploaded file is not a supported image.") from exc
+    except Image.DecompressionBombError as exc:
+        raise ValueError("Screenshot dimensions exceed the safe processing limit.") from exc
+
+    configured_executable = os.environ.get("TESSERACT_CMD", "").strip()
+    executable = configured_executable or shutil.which("tesseract")
+    if not executable:
+        common_executable = Path("C:/Program Files/Tesseract-OCR/tesseract.exe")
+        if common_executable.is_file():
+            executable = str(common_executable)
+    if executable:
+        pytesseract.pytesseract.tesseract_cmd = executable
+
+    try:
+        ocr_data = pytesseract.image_to_data(
+            rgb_image,
+            lang="eng",
+            config="--psm 6",
+            output_type=Output.DICT,
+            timeout=SCREENSHOT_OCR_TIMEOUT_SECONDS,
+        )
+    except pytesseract.TesseractNotFoundError as exc:
+        raise OcrUnavailableError(
+            "Tesseract is not installed or was not found. Install Tesseract OCR, then restart the app."
+        ) from exc
+    except RuntimeError as exc:
+        if "timeout" in str(exc).casefold():
+            raise OcrTimeoutError(
+                "Local OCR took too long. Try a smaller or simpler screenshot."
+            ) from exc
+        raise ValueError("Local OCR could not process this screenshot.") from exc
+    except pytesseract.TesseractError as exc:
+        raise ValueError("Local OCR could not read this screenshot. Try a clearer image.") from exc
+
+    lines: dict[tuple[str, str, str], list[str]] = {}
+    confidences: list[float] = []
+    for index, word in enumerate(ocr_data.get("text", [])):
+        cleaned_word = str(word).strip()
+        if not cleaned_word:
+            continue
+        key = tuple(str(ocr_data[field][index]) for field in ("block_num", "par_num", "line_num"))
+        lines.setdefault(key, []).append(cleaned_word)
+        try:
+            confidence = float(ocr_data["conf"][index])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if confidence >= 0:
+            confidences.append(confidence)
+
+    text = "\n".join(" ".join(words) for words in lines.values())
+    if len(text.encode("utf-8")) > MAX_SCREENSHOT_TEXT_BYTES:
+        raise ValueError("OCR found more than 100 KB of text. Crop the screenshot and try again.")
+    return {
+        "text": text,
+        "filename": "",
+        "format": image_format,
+        "width": width,
+        "height": height,
+        "word_count": sum(len(words) for words in lines.values()),
+        "confidence": round(sum(confidences) / len(confidences), 1) if confidences else None,
+    }
+
+
+def _analyze_screenshot_text(text: str, filename: str) -> dict[str, Any]:
+    if not text.strip():
+        raise ValueError("Review or enter the screenshot text before analyzing it.")
+    if len(text.encode("utf-8")) > MAX_SCREENSHOT_TEXT_BYTES:
+        raise ValueError("Screenshot text must be 100 KB or smaller.")
+    safe_filename = re.split(r"[\\/]", filename.strip())[-1][:200] or "screenshot"
+    report = analyze_message(f"Subject: Screenshot review - {safe_filename}\n\n{text}")
+    report["channel"] = "Screenshot OCR"
+    report["subject"] = f"Screenshot review - {safe_filename}"
+    report["sender"] = [{"name": "Screenshot OCR", "address": ""}]
+    report["screenshot_review"] = {
+        "filename": safe_filename,
+        "processing": "OCR performed locally; screenshot image not retained",
+    }
+    report["scoring"]["method"] += (
+        " Text was extracted by local OCR and may contain recognition errors; "
+        "visual layout, logos, QR codes, and actual link destinations were not verified."
+    )
+    return report
+
+
 def _virustotal_json(path: str, api_key: str) -> tuple[int, dict[str, Any] | None]:
     request = UrlRequest(
         f"{VIRUSTOTAL_API_URL}{path}",
@@ -470,7 +775,8 @@ def _store_report(report: dict[str, Any], user: dict[str, str]) -> tuple[str, st
     analyzed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     senders = report["sender"]
     sender = ", ".join(
-        f"{item['name']} <{item['address']}>" if item["name"] else item["address"]
+        f"{item['name']} <{item['address']}>" if item["name"] and item["address"]
+        else item["name"] or item["address"]
         for item in senders
     )
     stored_report = {key: value for key, value in report.items() if key != "body"}
@@ -518,7 +824,7 @@ def _store_report(report: dict[str, Any], user: dict[str, str]) -> tuple[str, st
                     uuid.uuid4().hex,
                     report_id,
                     analyzed_at,
-                    f"High-risk email detected (score {report['score']}/100).",
+                    f"High-risk message detected (score {report['score']}/100).",
                 ),
             )
     return report_id, analyzed_at
@@ -765,7 +1071,9 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             return
         feedback_request = path.startswith("/api/report/") and path.endswith("/feedback")
         if path not in {
-            "/preview", "/analyze", "/api/incidents", "/api/alerts/ack",
+            "/preview", "/analyze", "/api/whatsapp/analyze",
+            "/api/screenshot/ocr", "/api/screenshot/analyze",
+            "/api/incidents", "/api/alerts/ack",
             "/api/admin/users", "/api/admin/settings", "/api/admin/feedback/review",
         } and not (
             feedback_request or path.startswith("/api/incidents/")
@@ -779,9 +1087,83 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             return
         if feedback_request and self._authorize({"analyst", "admin"}) is None:
             return
-        required_field = "classification" if feedback_request else "email" if path in {"/preview", "/analyze"} else None
-        payload = self._read_payload(required_field=required_field)
+        required_field = (
+            "classification" if feedback_request else
+            "message" if path == "/api/whatsapp/analyze" else
+            "text" if path == "/api/screenshot/analyze" else
+            "email" if path in {"/preview", "/analyze"} else
+            None
+        )
+        payload = self._read_payload(
+            required_field=required_field,
+            max_payload_bytes=(
+                MAX_SCREENSHOT_REQUEST_BYTES if path == "/api/screenshot/ocr" else
+                MAX_SCREENSHOT_TEXT_BYTES + 16 * 1024 if path == "/api/screenshot/analyze" else
+                MAX_WHATSAPP_REQUEST_BYTES if path == "/api/whatsapp/analyze" else None
+            ),
+        )
         if payload is None:
+            return
+        if path == "/api/screenshot/ocr":
+            encoded_image = payload.get("image_base64")
+            filename = payload.get("filename")
+            if not isinstance(encoded_image, str) or not isinstance(filename, str):
+                self._send_json(400, {"error": "Provide a screenshot filename and base64 image data."})
+                return
+            if not encoded_image or len(filename) > 200:
+                self._send_json(400, {"error": "Choose a screenshot image with a filename no longer than 200 characters."})
+                return
+            try:
+                image_bytes = base64.b64decode(encoded_image, validate=True)
+            except (binascii.Error, ValueError):
+                self._send_json(400, {"error": "Screenshot image data must be valid base64."})
+                return
+            if len(image_bytes) > MAX_SCREENSHOT_BYTES:
+                self._send_json(413, {"error": "Screenshot images must be 5 MB or smaller."})
+                return
+            safe_filename = re.split(r"[\\/]", filename.strip())[-1] or "screenshot"
+            try:
+                ocr_result = _ocr_screenshot(image_bytes)
+            except OcrUnavailableError as exc:
+                self._send_json(503, {"error": str(exc)})
+                return
+            except OcrTimeoutError as exc:
+                self._send_json(504, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                status = 413 if "100 KB" in str(exc) or "5 MB" in str(exc) else 400
+                self._send_json(status, {"error": str(exc)})
+                return
+            ocr_result["filename"] = safe_filename
+            _audit(user, "screenshot.ocr_completed", {
+                "format": ocr_result["format"],
+                "width": ocr_result["width"],
+                "height": ocr_result["height"],
+                "word_count": ocr_result["word_count"],
+            })
+            self._send_json(200, ocr_result)
+            return
+        if path == "/api/screenshot/analyze":
+            text = payload["text"]
+            filename = payload.get("filename", "")
+            if not isinstance(filename, str) or len(filename) > 200:
+                self._send_json(400, {"error": "Screenshot filename must be text no longer than 200 characters."})
+                return
+            try:
+                report = _analyze_screenshot_text(text, filename)
+            except ValueError as exc:
+                status = 413 if "100 KB" in str(exc) else 400
+                self._send_json(status, {"error": str(exc)})
+                return
+            _apply_rule_adjustments(report, _load_rule_adjustments())
+            report["report_id"], report["analyzed_at"] = _store_report(report, user)
+            _audit(user, "screenshot.text_analyzed", {
+                "report_id": report["report_id"],
+                "level": report["level"],
+                "score": report["score"],
+            })
+            report.pop("body", None)
+            self._send_json(200, report)
             return
         if path == "/api/incidents":
             self._create_incident(user, payload)
@@ -806,6 +1188,43 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if feedback_request:
             report_id = path.removeprefix("/api/report/").removesuffix("/feedback").strip("/")
             self._save_feedback(report_id, payload, user)
+            return
+        if path == "/api/whatsapp/analyze":
+            message_text = payload["message"]
+            if not message_text.strip():
+                self._send_json(400, {"error": "Paste the suspicious WhatsApp message before reviewing."})
+                return
+            if len(message_text.encode("utf-8")) > MAX_WHATSAPP_MESSAGE_BYTES:
+                self._send_json(413, {"error": "WhatsApp message text must be 100 KB or smaller."})
+                return
+            zip_encoded = payload.get("zip_base64", "")
+            zip_filename = payload.get("zip_filename", "")
+            if not isinstance(zip_encoded, str) or not isinstance(zip_filename, str):
+                self._send_json(400, {"error": "ZIP upload data and filename must be text."})
+                return
+            if bool(zip_encoded) != bool(zip_filename):
+                self._send_json(400, {"error": "Provide both the ZIP file and its filename, or leave both empty."})
+                return
+            try:
+                zip_inspection, archive_findings = (
+                    _inspect_whatsapp_zip(zip_encoded, zip_filename)
+                    if zip_encoded
+                    else (None, [])
+                )
+                report = _analyze_whatsapp_message(message_text, zip_inspection, archive_findings)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            _apply_rule_adjustments(report, _load_rule_adjustments())
+            report["report_id"], report["analyzed_at"] = _store_report(report, user)
+            _audit(user, "whatsapp.message_analyzed", {
+                "report_id": report["report_id"],
+                "level": report["level"],
+                "score": report["score"],
+                "zip_attached": zip_inspection is not None,
+            })
+            report.pop("body", None)
+            self._send_json(200, report)
             return
         if path == "/preview":
             try:
@@ -880,7 +1299,12 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         _audit(user, "report.deleted", {"report_id": report_id, "level": report["level"], "score": report["score"]})
         self._send_json(200, {"deleted": True})
 
-    def _read_payload(self, *, required_field: str | None = "email") -> dict[str, Any] | None:
+    def _read_payload(
+        self,
+        *,
+        required_field: str | None = "email",
+        max_payload_bytes: int | None = None,
+    ) -> dict[str, Any] | None:
         content_length = self.headers.get("Content-Length")
         try:
             request_size = int(content_length) if content_length is not None else -1
@@ -889,14 +1313,14 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         if request_size < 0:
             self._send_json(400, {"error": "A valid Content-Length is required."})
             return None
-        if request_size > MAX_REQUEST_BYTES:
+        payload_limit = max_payload_bytes or (
+            MAX_REQUEST_BYTES if required_field == "email" else 16 * 1024
+        )
+        if request_size > min(payload_limit, MAX_REQUEST_BYTES):
             self._send_json(413, {"error": "Request body exceeds the upload limit."})
             return None
-        if required_field != "email" and request_size > 16 * 1024:
-            self._send_json(413, {"error": "Request body exceeds the 16 KB limit."})
-            return None
         if self.headers.get_content_type() != "application/json":
-            self._send_json(415, {"error": "Send email content as application/json."})
+            self._send_json(415, {"error": "Send request data as application/json."})
             return None
         try:
             payload: Any = json.loads(self.rfile.read(request_size))
@@ -1082,7 +1506,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
             "start": start_date,
             "end": end_date,
             "totals": {
-                "emails": sum(point["total"] for point in points),
+                "messages": sum(point["total"] for point in points),
                 "high": sum(point["high"] for point in points),
                 "suspicious": sum(point["suspicious"] for point in points),
                 "low": sum(point["low"] for point in points),
@@ -1911,9 +2335,11 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
         y -= 16
 
     start_page()
-    draw_text(50, y, "Phishing risk analysis", font="F2", size=22)
+    channel = str(report.get("channel") or "Email")
+    draw_text(50, y, "WhatsApp scam review" if channel == "WhatsApp" else "Phishing risk analysis",
+              font="F2", size=22)
     y -= 18
-    draw_text(50, y, "Email review report  |  Evidence-led heuristic screening",
+    draw_text(50, y, f"{channel} review report  |  Evidence-led heuristic screening",
               size=10, color=(0.39, 0.46, 0.43))
     y -= 31
 
@@ -1932,7 +2358,7 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
     draw_text(207, y - 46, {
         "HIGH": "Treat as high risk. Do not interact; report to your security team.",
         "SUSPICIOUS": "Verify independently before replying, clicking, or sharing information.",
-        "LOW": "No configured indicators matched. This is not proof the email is safe.",
+        "LOW": "No configured indicators matched. This is not proof the message or file is safe.",
     }.get(severity, "Review the evidence and verify unexpected requests independently."),
               size=8)
     y -= 78
@@ -1961,6 +2387,10 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
 
     add_section("Message details")
     add_detail("SUBJECT", str(report.get("subject") or "Not present"))
+    add_detail("SOURCE CHANNEL", str(report.get("channel") or "Email"))
+    screenshot_review = report.get("screenshot_review")
+    if screenshot_review:
+        add_detail("SCREENSHOT OCR", str(screenshot_review.get("processing") or ""))
     add_detail("SENDER", str(report.get("sender") or "Not present"))
     add_detail("RECIPIENTS", _format_addresses(report.get("recipients", [])) or "Not present")
     add_detail("REPLY-TO", _format_addresses(report.get("reply_to", [])) or "Not present")
@@ -2076,6 +2506,20 @@ def _build_pdf(report: dict[str, Any]) -> bytes:
         )
         add_paragraph(f"SHA-256: {attachment.get('sha256', 'Not available')}",
                       indent=15, size=8, width=88, gap=2)
+        archive = attachment.get("zip_inspection")
+        if isinstance(archive, dict):
+            add_paragraph(
+                f"ZIP directory only: {archive.get('entry_count', 0)} entries; "
+                f"{archive.get('declared_uncompressed_bytes', 0)} declared uncompressed bytes; "
+                f"{archive.get('scan_status', 'not scanned')}.",
+                indent=15,
+                size=8,
+                width=86,
+            )
+            for entry_name in archive.get("listed_entries", [])[:20]:
+                add_paragraph(f"Listed entry: {entry_name}", indent=20, size=8, width=83)
+            if archive.get("listing_truncated"):
+                add_paragraph("ZIP entry listing truncated; remaining names not shown.", indent=20, size=8)
     if not attachments:
         add_paragraph("No attachment metadata was extracted.")
 

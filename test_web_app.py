@@ -1,12 +1,17 @@
+import base64
+import hashlib
+import io
 import os
 import sqlite3
 import tempfile
 import json
 import threading
 import unittest
+import zipfile
 from contextlib import closing
 from email.message import EmailMessage
 from http.server import ThreadingHTTPServer
+from PIL import Image
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -21,6 +26,10 @@ from web_app import (
     MAX_EMAIL_BYTES,
     _build_pdf,
     _create_initial_admin,
+    _inspect_whatsapp_zip,
+    _analyze_whatsapp_message,
+    _analyze_screenshot_text,
+    _ocr_screenshot,
     _migrate_feedback_schema,
     _migrate_incident_schema,
     _spreadsheet_safe,
@@ -593,7 +602,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(today_point["high"], today_before["high"] + 1)
             self.assertEqual(today_point["urls"], today_before["urls"] + 1)
             self.assertEqual(today_point["legitimate"], today_before["legitimate"] + 1)
-            self.assertEqual(daily["totals"]["emails"], daily_before["totals"]["emails"] + 2)
+            self.assertEqual(daily["totals"]["messages"], daily_before["totals"]["messages"] + 2)
             self.assertEqual(daily["totals"]["urls"], daily_before["totals"]["urls"] + 1)
             self.assertEqual(daily["totals"]["legitimate"], daily_before["totals"]["legitimate"] + 1)
             self.assertEqual(
@@ -613,7 +622,7 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(month_point["total"], month_before["total"] + 2)
             self.assertEqual(month_point["high"], month_before["high"] + 1)
             self.assertEqual(month_point["legitimate"], month_before["legitimate"] + 1)
-            self.assertEqual(monthly["totals"]["emails"], monthly_before["totals"]["emails"] + 2)
+            self.assertEqual(monthly["totals"]["messages"], monthly_before["totals"]["messages"] + 2)
             self.assertEqual(
                 monthly["reviewed"]["legitimate"],
                 monthly_before["reviewed"]["legitimate"] + 1,
@@ -948,6 +957,240 @@ class WebAppTests(unittest.TestCase):
             ).fetchone()["sql"],
         )
         incident_db.close()
+
+    def test_whatsapp_zip_review_checks_metadata_without_extracting_or_storing_chat(self) -> None:
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("Read me.txt", "Harmless placeholder.")
+            archive.writestr("Documents/invoice.pdf.exe", "not an executable")
+            archive.writestr("../outside.ps1", "not a script")
+            archive.writestr("nested.zip", "not inspected")
+        zip_bytes = archive_buffer.getvalue()
+        encoded_zip = base64.b64encode(zip_bytes).decode("ascii")
+        inspection, archive_findings = _inspect_whatsapp_zip(encoded_zip, "received.zip")
+        self.assertEqual(inspection["entry_count"], 4)
+        self.assertEqual(inspection["unsafe_path_count"], 1)
+        self.assertEqual(inspection["nested_archive_count"], 1)
+        self.assertEqual(
+            inspection["sha256"],
+            hashlib.sha256(zip_bytes).hexdigest(),
+        )
+        self.assertEqual(len(archive_findings), 3)
+        direct_report = _analyze_whatsapp_message(
+            "Please verify your password immediately.",
+            inspection,
+            archive_findings,
+        )
+        self.assertEqual(direct_report["channel"], "WhatsApp")
+        self.assertEqual(direct_report["zip_inspection"]["filename"], "received.zip")
+        self.assertGreaterEqual(direct_report["score"], 55)
+
+        unique_chat_text = "Do not share this exact sample phrase 738291."
+        request = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({
+                "message": f"{unique_chat_text} Verify your password immediately.",
+                "zip_filename": "received.zip",
+                "zip_base64": encoded_zip,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            report = json.loads(response.read())
+
+        report_id = report["report_id"]
+        try:
+            self.assertEqual(report["channel"], "WhatsApp")
+            self.assertNotIn("body", report)
+            self.assertEqual(report["zip_inspection"]["entry_count"], 4)
+            self.assertEqual(report["attachments"][0]["scan_status"].split(";")[0], "ZIP directory metadata only")
+            with urlopen(f"{self.base_url}/api/report/{report_id}") as response:
+                saved_report = json.loads(response.read())
+            self.assertEqual(saved_report["subject"], "WhatsApp scam review")
+            self.assertEqual(saved_report["sender"], "WhatsApp conversation")
+            self.assertNotIn("body", saved_report)
+            pdf = _build_pdf(saved_report)
+            self.assertIn(b"WhatsApp scam review", pdf)
+            self.assertIn(b"ZIP directory only", pdf)
+            self.assertIn(b"Documents/invoice.pdf.exe", pdf)
+            with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+                stored_json = connection.execute(
+                    "SELECT report_json FROM reports WHERE id = ?",
+                    (report_id,),
+                ).fetchone()[0]
+            self.assertNotIn(unique_chat_text, stored_json)
+            self.assertNotIn(base64.b64decode(encoded_zip).decode("latin-1"), stored_json)
+        finally:
+            with urlopen(Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")):
+                pass
+
+    def test_screenshot_ocr_extracts_lines_and_reports_confidence(self) -> None:
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (40, 30), "white").save(image_buffer, format="PNG")
+        with mock.patch("pytesseract.image_to_data", return_value={
+            "text": ["Verify", "account", "now"],
+            "conf": ["90", "80", "70"],
+            "block_num": ["1", "1", "1"],
+            "par_num": ["1", "1", "1"],
+            "line_num": ["1", "1", "1"],
+        }):
+            result = _ocr_screenshot(image_buffer.getvalue())
+        self.assertEqual(result["text"], "Verify account now")
+        self.assertEqual(result["format"], "PNG")
+        self.assertEqual((result["width"], result["height"]), (40, 30))
+        self.assertEqual(result["word_count"], 3)
+        self.assertEqual(result["confidence"], 80.0)
+
+        direct_report = _analyze_screenshot_text("Visible message text.", r"C:\private\chat.png")
+        self.assertEqual(direct_report["channel"], "Screenshot OCR")
+        self.assertEqual(direct_report["screenshot_review"]["filename"], "chat.png")
+
+        with self.assertRaisesRegex(ValueError, "not a supported image"):
+            _ocr_screenshot(b"not an image")
+
+        class OversizedImage:
+            format = "PNG"
+            size = (4097, 4000)
+            is_animated = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        with mock.patch("PIL.Image.open", return_value=OversizedImage()):
+            with self.assertRaisesRegex(ValueError, "16 megapixels"):
+                _ocr_screenshot(b"encoded image placeholder")
+        with self.assertRaisesRegex(ValueError, "5 MB"):
+            _ocr_screenshot(b"x" * (5 * 1024 * 1024 + 1))
+
+    def test_screenshot_review_is_local_and_saved_report_excludes_image_and_full_text(self) -> None:
+        image_bytes = b"not retained screenshot bytes"
+        ocr_text = "This is a harmless screenshot reference 482731."
+        ocr_result = {
+            "text": ocr_text,
+            "filename": "",
+            "format": "PNG",
+            "width": 400,
+            "height": 300,
+            "word_count": 8,
+            "confidence": 91.2,
+        }
+        ocr_request = Request(
+            f"{self.base_url}/api/screenshot/ocr",
+            data=json.dumps({
+                "filename": r"C:\private\chat.png",
+                "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with mock.patch("web_app._ocr_screenshot", return_value=dict(ocr_result)) as ocr:
+            with urlopen(ocr_request) as response:
+                extracted = json.loads(response.read())
+        ocr.assert_called_once_with(image_bytes)
+        self.assertEqual(extracted["filename"], "chat.png")
+        self.assertEqual(extracted["text"], ocr_text)
+
+        with self.assertRaises(HTTPError) as invalid_image:
+            invalid_request = Request(
+                f"{self.base_url}/api/screenshot/ocr",
+                data=json.dumps({"filename": "bad.png", "image_base64": "!not-base64!"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urlopen(invalid_request)
+        self.assertEqual(invalid_image.exception.code, 400)
+
+        report_request = Request(
+            f"{self.base_url}/api/screenshot/analyze",
+            data=json.dumps({"filename": extracted["filename"], "text": extracted["text"]}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(report_request) as response:
+            report = json.loads(response.read())
+        report_id = report["report_id"]
+        try:
+            self.assertEqual(report["channel"], "Screenshot OCR")
+            self.assertNotIn("body", report)
+            self.assertEqual(report["screenshot_review"]["filename"], "chat.png")
+            with urlopen(f"{self.base_url}/api/report/{report_id}") as response:
+                saved_report = json.loads(response.read())
+            self.assertNotIn("body", saved_report)
+            self.assertEqual(
+                saved_report["screenshot_review"]["processing"],
+                "OCR performed locally; screenshot image not retained",
+            )
+            with closing(sqlite3.connect(DATABASE_PATH)) as connection:
+                stored_json = connection.execute(
+                    "SELECT report_json FROM reports WHERE id = ?",
+                    (report_id,),
+                ).fetchone()[0]
+            self.assertNotIn(ocr_text, stored_json)
+            self.assertNotIn(base64.b64encode(image_bytes).decode("ascii"), stored_json)
+            self.assertNotIn(image_bytes.decode("ascii"), stored_json)
+        finally:
+            with urlopen(Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")):
+                pass
+
+    def test_whatsapp_zip_review_rejects_invalid_archive_and_empty_message(self) -> None:
+        invalid_archive = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({
+                "message": "Suspicious file attached.",
+                "zip_filename": "bad.zip",
+                "zip_base64": base64.b64encode(b"not a zip").decode("ascii"),
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as invalid:
+            urlopen(invalid_archive)
+        self.assertEqual(invalid.exception.code, 400)
+
+        empty_message = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({"message": "  "}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as empty:
+            urlopen(empty_message)
+        self.assertEqual(empty.exception.code, 400)
+
+        chat_only = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({"message": "A message with no ZIP selected."}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(chat_only) as response:
+            report = json.loads(response.read())
+        self.assertIsNone(report["zip_inspection"])
+        with urlopen(Request(f"{self.base_url}/api/report/{report['report_id']}", method="DELETE")):
+            pass
+
+    def test_whatsapp_zip_review_rejects_archives_over_entry_limit(self) -> None:
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w") as archive:
+            for index in range(1001):
+                archive.writestr(f"entry-{index}.txt", "x")
+        request = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({
+                "message": "Please review this download.",
+                "zip_filename": "too-many.zip",
+                "zip_base64": base64.b64encode(archive_buffer.getvalue()).decode("ascii"),
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(request)
+        self.assertEqual(raised.exception.code, 400)
 
     def test_pdf_download_returns_valid_pdf_structure(self) -> None:
         request = Request(

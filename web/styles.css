@@ -199,6 +199,17 @@ h1 {
 .trend-segment.trend-low { background: #329372; }
 .trend-date { align-self: center; color: var(--muted); font-size: 9px; white-space: nowrap; }
 
+.whatsapp-review-card { scroll-margin-top: 18px; }
+.whatsapp-review-form { display: grid; max-width: 900px; gap: 10px; }
+.whatsapp-review-form > label:not(.file-button) { color: var(--ink); font-size: 12px; font-weight: 700; }
+.whatsapp-review-form textarea { min-height: 140px; resize: vertical; }
+.whatsapp-review-form .file-button { width: fit-content; }
+.whatsapp-review-result { display: grid; gap: 12px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+.whatsapp-review-result h3, .whatsapp-review-result h4 { margin: 0; }
+.whatsapp-review-result .risk-banner { margin: 0; }
+.whatsapp-archive-result { display: grid; gap: 8px; min-width: 0; }
+.whatsapp-archive-result li { overflow-wrap: anywhere; }
+
 .metric {
   display: grid;
   gap: 7px;
@@ -517,6 +528,15 @@ button { padding: 0 17px; }
 .user-action-form select, .user-action-form input { min-height: 32px; padding: 5px; border: 1px solid var(--line); border-radius: 5px; background: #fff; font: inherit; font-size: 11px; }
 .user-action-form input[type="checkbox"] { width: auto; min-height: auto; }
 .admin-card > h3, #admin-card > h3 { margin: 18px 0 8px; font-size: 14px; }
+.screenshot-review-card { scroll-margin-top: 18px; }
+.screenshot-review-form, .screenshot-text-review { display: grid; gap: 10px; }
+.screenshot-review-form > label:not(.file-button), .screenshot-text-review > label { color: var(--muted); font-size: 12px; font-weight: 700; }
+.screenshot-preview { display: block; max-width: min(100%, 640px); max-height: 420px; margin: 4px auto; border: 1px solid var(--line); border-radius: 8px; object-fit: contain; background: #f8fafc; }
+.screenshot-preview[hidden] { display: none; }
+.screenshot-text-review { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+.screenshot-text-review h3 { margin: 0; font-size: 14px; }
+#screenshot-ocr-text { width: 100%; min-height: 170px; resize: vertical; padding: 10px; border: 1px solid var(--line); border-radius: 7px; font: 12px/1.5 Consolas, monospace; }
+.screenshot-review-form button:disabled, .screenshot-text-review button:disabled { cursor: not-allowed; opacity: .6; }
 .export-link { text-decoration: none; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }

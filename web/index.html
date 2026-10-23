@@ -30,6 +30,8 @@
         <nav class="sidebar-nav">
           <a class="nav-link is-active" href="#overview" aria-current="page"><span aria-hidden="true">◫</span>Overview</a>
           <a class="nav-link" href="#email-analysis"><span aria-hidden="true">✉</span>Email Analysis</a>
+          <a class="nav-link" href="#whatsapp-review"><span aria-hidden="true">◉</span>WhatsApp Scam Review</a>
+          <a class="nav-link" href="#screenshot-review"><span aria-hidden="true">▧</span>Screenshot Review</a>
           <a class="nav-link" href="#threat-detections"><span aria-hidden="true">⌁</span>Threat Detections</a>
           <a class="nav-link analyst-nav" href="#investigations" hidden><span aria-hidden="true">◎</span>Investigations</a>
           <a class="nav-link" href="#analysis-history"><span aria-hidden="true">◷</span>Analysis History</a>
@@ -57,7 +59,7 @@
           <div><p class="eyebrow">ALL SAVED REPORTS</p><h2 id="severity-title">Severity distribution</h2></div>
           <span class="status-tag">Updated with analysis history</span>
         </div>
-        <p id="severity-summary" class="severity-summary" aria-live="polite">No email reports analyzed yet.</p>
+        <p id="severity-summary" class="severity-summary" aria-live="polite">No reports analyzed yet.</p>
         <div id="severity-bar" class="severity-bar" role="img" aria-label="Severity distribution: no reports yet">
           <span id="severity-bar-low" class="severity-segment severity-low"></span>
           <span id="severity-bar-suspicious" class="severity-segment severity-suspicious"></span>
@@ -287,12 +289,88 @@
 
       </div>
 
+      <section id="whatsapp-review" class="card whatsapp-review-card" aria-labelledby="whatsapp-review-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">MESSAGING APP SCAMS</p>
+            <h2 id="whatsapp-review-title">WhatsApp message and ZIP review</h2>
+          </div>
+        </div>
+        <p class="history-privacy">Paste the suspicious chat and optionally add its downloaded ZIP. This local check reviews message indicators and ZIP directory metadata only. It never extracts, opens, or runs files and is not an antivirus scan.</p>
+        <form id="whatsapp-review-form" class="whatsapp-review-form">
+          <label for="whatsapp-message">WhatsApp message text</label>
+          <textarea id="whatsapp-message" maxlength="102400" required placeholder="Paste the suspicious message here. Remove personal details you do not need analyzed."></textarea>
+          <label class="file-button" for="whatsapp-zip">Choose suspicious ZIP (optional)</label>
+          <input id="whatsapp-zip" class="visually-hidden" type="file" accept=".zip,application/zip,application/x-zip-compressed">
+          <p id="whatsapp-zip-name" class="file-name">No ZIP selected.</p>
+          <p class="field-help">If the ZIP is already downloaded, do not open or extract it. Maximum 10 MB and 1,000 entries. Only the filename, ZIP directory listing, declared sizes, flags, and file hash are checked; file contents are not read or uploaded to an external service.</p>
+          <div class="actions">
+            <button id="whatsapp-review-button" class="primary-button" type="submit">Review message and ZIP</button>
+            <button id="whatsapp-clear-button" class="secondary-button" type="button">Clear</button>
+          </div>
+        </form>
+        <p id="whatsapp-review-error" class="error-message" role="alert" hidden></p>
+        <section id="whatsapp-review-result" class="whatsapp-review-result" aria-live="polite" hidden>
+          <div class="section-heading">
+            <div><p class="eyebrow">LOCAL HEURISTIC REVIEW</p><h3>Review results</h3></div>
+            <span id="whatsapp-report-id" class="status-tag"></span>
+          </div>
+          <div id="whatsapp-risk-banner" class="risk-banner">
+            <div><p class="eyebrow">INDICATOR RISK</p><strong id="whatsapp-risk-level"></strong></div>
+            <div class="score-block"><span id="whatsapp-risk-score" class="risk-score"></span><span class="score-caption">/ 100</span></div>
+          </div>
+          <p id="whatsapp-review-disclaimer" class="history-privacy"></p>
+          <h4>Message and archive indicators</h4>
+          <ul id="whatsapp-findings" class="findings-list"></ul>
+          <div id="whatsapp-archive-result" class="whatsapp-archive-result" hidden>
+            <h4>ZIP directory inspection</h4>
+            <p id="whatsapp-archive-summary" class="history-privacy"></p>
+            <p id="whatsapp-archive-hash" class="history-privacy"></p>
+            <ul id="whatsapp-archive-entries" class="compact-list"></ul>
+          </div>
+          <a class="text-link" href="#analysis-history">Saved report is available in Analysis History</a>
+        </section>
+      </section>
+
+      <section id="screenshot-review" class="card screenshot-review-card" aria-labelledby="screenshot-review-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">LOCAL IMAGE TEXT EXTRACTION</p>
+            <h2 id="screenshot-review-title">Screenshot phishing review</h2>
+          </div>
+        </div>
+        <p class="history-privacy">The selected image is processed in memory by local Tesseract OCR and is not saved or sent to an external service. Review and correct the extracted text before analysis. The saved report may retain matching evidence snippets, but never the screenshot or full OCR text.</p>
+        <form id="screenshot-ocr-form" class="screenshot-review-form">
+          <label class="file-button" for="screenshot-file">Choose screenshot</label>
+          <input id="screenshot-file" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/bmp">
+          <p id="screenshot-file-name" class="file-name">No screenshot selected.</p>
+          <p class="field-help">PNG, JPEG, WebP, or BMP · maximum 5 MB and 16 megapixels. OCR reads English text only and can make mistakes. It does not verify logos, layout, QR codes, or actual link destinations.</p>
+          <img id="screenshot-preview" class="screenshot-preview" alt="Selected screenshot preview" hidden>
+          <div class="actions">
+            <button id="screenshot-ocr-button" class="primary-button" type="submit" disabled>Extract text locally</button>
+            <button id="screenshot-clear-button" class="secondary-button" type="button">Clear screenshot</button>
+          </div>
+        </form>
+        <p id="screenshot-ocr-error" class="error-message" role="alert" hidden></p>
+        <section id="screenshot-text-review" class="screenshot-text-review" hidden aria-labelledby="screenshot-text-title">
+          <h3 id="screenshot-text-title">Review the extracted text</h3>
+          <p id="screenshot-ocr-summary" class="history-privacy"></p>
+          <label for="screenshot-ocr-text">Edit OCR text before analysis</label>
+          <textarea id="screenshot-ocr-text" maxlength="102400" spellcheck="false" placeholder="OCR text will appear here. You may correct it or enter visible text manually."></textarea>
+          <p class="field-help">Check spelling, URLs, phone numbers, sender details, and any missing or unclear text against the original image. Do not click links or scan QR codes.</p>
+          <div class="actions">
+            <button id="screenshot-analyze-button" class="primary-button" type="button" disabled>Analyze reviewed text</button>
+          </div>
+        </section>
+        <p id="screenshot-analyze-error" class="error-message" role="alert" hidden></p>
+      </section>
+
       <section id="analysis-history" class="card history-card" aria-labelledby="history-title">
         <div class="section-heading">
           <div><p class="eyebrow">REPORTS</p><h2 id="history-title">Analysis history</h2></div>
           <a class="file-button export-link" href="/api/export.csv">Export CSV</a>
         </div>
-        <p class="history-privacy">History stores the subject, sender, score, findings, URLs and attachment metadata—not the email body or attachment contents. Reports remain in the application data folder until deleted.</p>
+        <p class="history-privacy">History stores subjects, senders, scores, findings, URLs, attachment metadata, and ZIP directory names—not full message bodies or attachment contents. Matching evidence snippets and filenames may be retained. Reports remain in the application data folder until deleted.</p>
         <form id="history-filter" class="history-filter">
           <label>Search sender or subject<input id="history-query" type="search" maxlength="200" placeholder="Search sender, subject, or domain"></label>
           <label>Risk level<select id="history-risk"><option value="">All risks</option><option value="LOW">Low risk</option><option value="SUSPICIOUS">Suspicious</option><option value="HIGH">High risk</option></select></label>

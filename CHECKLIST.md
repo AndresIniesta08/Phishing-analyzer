@@ -20,22 +20,43 @@ is malicious.
 
 ## 2. If the evidence is a screenshot
 
-The app cannot open images, run OCR, inspect image pixels, or determine a
-link's real destination from a screenshot. Review the screenshot yourself
-before entering a transcription.
+The **Screenshot Review** workflow can extract English text with local
+Tesseract OCR. The image is processed in memory on this computer and is not
+saved or sent to an external service. OCR can misread or omit content; it does
+not establish that a message is safe or malicious.
 
-- [ ] Visually inspect and record only details that are actually shown:
-  display name, sender address, recipient, subject, message, attachment names,
-  and any visible security warnings.
-- [ ] Check logos, layout, fonts, spacing, signature, and thread context for
-  inconsistencies. These visual clues are not scored by the analyzer.
+- [ ] Keep the original screenshot unchanged. Do not click links, scan QR codes,
+  open attachments, reply, or call numbers shown in it.
+- [ ] In the app, choose **Screenshot Review** and select a PNG, JPEG, WebP, or
+  BMP file no larger than 5 MB or 16 megapixels. If local OCR is unavailable,
+  ask IT/security to install the project requirements and Tesseract, or
+  transcribe the visible text manually.
+- [ ] Select **Extract text locally**. Confirm the displayed format, dimensions,
+  word count, and approximate OCR confidence; confidence is not a risk score.
+- [ ] Compare the complete extracted text with the image, line by line. Correct
+  misspelled names, numbers, punctuation, email addresses, phone numbers,
+  dates, domains, and URL characters. Restore omitted text where readable.
+  Clearly label unreadable or cropped content instead of guessing.
+- [ ] Visually inspect the screenshot independently: sender/display name,
+  visible address, recipient, subject, message, timestamps, attachment names,
+  warnings, signature, and conversation context. A screenshot may not include
+  full headers or the actual link destination.
+- [ ] Check branding and interface details (logo, layout, fonts, spacing, app
+  domain, and alignment) for inconsistencies. OCR and the analyzer do not score
+  these visual clues or prove that an interface is genuine.
 - [ ] Note visible link text without clicking it. If the actual URL is not
   visible, record the destination as **unknown**; displayed text alone does not
   prove where a link leads.
-- [ ] Note QR codes, but do not scan them as part of this review.
-- [ ] Transcribe visible text faithfully into the analyzer. Label any omitted
-  or unclear detail **not visible** or **unreadable**; do not guess headers,
-  destinations, or attachment behavior.
+- [ ] Do not scan QR codes. A screenshot does not reveal a link's true target,
+  attachment contents, or sender authentication.
+- [ ] After correcting the OCR text, select **Analyze reviewed text**. Compare
+  each finding with the screenshot and independently verify unexpected
+  requests. A low score is not proof of safety.
+- [ ] If the screenshot shows a downloaded ZIP, do not open or extract it; use
+  the dedicated WhatsApp ZIP review only if permitted by your organization.
+- [ ] Clear the screenshot workflow when finished. Saved reports retain the
+  filename and may retain matching evidence snippets, not the screenshot bytes
+  or full OCR text.
 
 ## 3. Review the sender and subject
 
@@ -98,6 +119,19 @@ before entering a transcription.
 - [ ] If inspection is needed, use approved security scanning tools or contact
   IT/security. Do not open the attachment to test it.
 
+### WhatsApp message with a downloaded ZIP
+
+- [ ] Do not open or extract the ZIP. Preserve the chat and use the dedicated
+  **WhatsApp Scam Review** with a copy of the message and ZIP if approved.
+- [ ] Review detected message indicators, ZIP member names, suspicious
+  executable/app extensions, encrypted entries, unsafe paths, declared sizes,
+  nested archive notices, and the local SHA-256.
+- [ ] Treat this as metadata-only triage: archive contents are not read,
+  extracted, run, or antivirus-scanned. A LOW score is not proof of safety.
+- [ ] Use approved endpoint protection or security-team procedures for malware
+  scanning and incident response. Do not send the ZIP to an external service
+  unless authorized.
+
 ## 7. Review headers and authentication when available
 
 - [ ] Review SPF, DKIM, and DMARC results in the original message headers or
@@ -115,11 +149,11 @@ before entering a transcription.
 
 - [ ] Start the app with `python .\phishing_analyzer.py` or double-click
   `launch_app.pyw`.
-- [ ] Paste the screenshot transcription, paste message text, or choose **Open
-  email file** for a `.eml` or `.txt` file. Image files are not supported.
+- [ ] For screenshots, follow section 2 and analyze the reviewed local OCR text.
+  For other messages, paste text or choose an `.eml` or `.txt` file.
 - [ ] Include complete headers when available. A screenshot transcription may
-  lack headers, actual link targets, and attachment contents; do not invent
-  missing information.
+  lack headers, actual link targets, and attachment contents; OCR may misread
+  or omit text, so check it against the image and do not invent missing data.
 - [ ] Select **Analyze message** and record the risk level, score, URL count,
   and each finding.
 - [ ] Compare the findings with the original evidence. The analyzer checks
@@ -148,7 +182,10 @@ Run these checks from the project directory. Automated checks validate
 program behavior; they do not establish that any particular email is safe.
 
 - [ ] Confirm Python 3.10 or later is installed.
-- [ ] Run `python -m unittest -v`; all 27 automated tests should pass.
+- [ ] Install Python OCR dependencies with `python -m pip install -r .\requirements.txt`
+  and install Tesseract with `winget install --id UB-Mannheim.TesseractOCR --exact`
+  if screenshot OCR is being verified.
+- [ ] Run `python -m unittest -v`; all 50 automated tests should pass.
 - [ ] Confirm ordinary-message test: LOW risk, score `0`.
 - [ ] Confirm `http://bit.ly/...` produces both shortener and unencrypted-HTTP
   findings (19 points before any other findings).
@@ -214,6 +251,17 @@ program behavior; they do not establish that any particular email is safe.
   and surface missing/rate-limited results without calling them safe.
 - [ ] Confirm empty input and input larger than 10 MB show clear errors.
 - [ ] Confirm analysis history stores no email body or attachment bytes.
+- [ ] Review WhatsApp chat text with and without a ZIP; verify the ZIP is
+  inspected as metadata only, no archive member is extracted or executed, and
+  invalid, oversized, or over-1,000-entry archives are rejected.
+- [ ] Confirm WhatsApp reports retain findings/evidence and ZIP directory
+  metadata, not the complete chat text or ZIP bytes.
+- [ ] Verify screenshot OCR uses only the local Tesseract engine; inspect and
+  correct text before analysis; confirm invalid formats, over-5-MB files,
+  over-16-megapixel images, OCR failures, and empty/oversized text are handled
+  clearly.
+- [ ] Confirm screenshot images and full OCR text are absent from saved reports
+  and that reports identify screenshot OCR and warn that OCR is uncertain.
 - [ ] Confirm the server listens only on `127.0.0.1`, and stop it with Ctrl+C.
 
 ## 11. Provider-dependent integrations (partially configured)
@@ -267,8 +315,8 @@ loopback and is not hardened for network or multi-tenant use.
 
 - Date:
 - Message reference (do not include sensitive content):
-- Evidence type: pasted text / `.eml` / `.txt` / screenshot transcription
-- Screenshot reviewed manually: yes / no / not applicable
+- Evidence type: pasted text / `.eml` / `.txt` / screenshot with local OCR
+- Screenshot visually reviewed and OCR corrected: yes / no / not applicable
 - Details not visible, unreadable, or unknown:
 - Sender/domain and subject concerns:
 - Link and attachment concerns:
