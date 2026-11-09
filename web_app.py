@@ -1,4 +1,4 @@
-"""Loopback-only web interface and local report history for email analysis."""
+"""Local web interface and report history for email analysis."""
 
 from __future__ import annotations
 
@@ -53,6 +53,8 @@ MAX_REQUEST_BYTES = 64 * 1024 * 1024
 HISTORY_LIMIT = 100
 SESSION_COOKIE = "phishing_session"
 SESSION_TTL_HOURS = 8
+AZURE_ALLOWED_HOSTS_ENV = "PHISHING_ANALYZER_ALLOWED_HOSTS"
+AZURE_ALLOWED_ORIGINS_ENV = "PHISHING_ANALYZER_ALLOWED_ORIGINS"
 PASSWORD_ITERATIONS = 310_000
 VALID_ROLES = {"user", "analyst", "admin"}
 VALID_INCIDENT_STATUSES = {"open", "investigating", "resolved", "false_positive"}
@@ -843,6 +845,89 @@ def _report_summary(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _azure_allowed_hosts() -> set[str]:
+    configured = os.environ.get(AZURE_ALLOWED_HOSTS_ENV, "")
+    hosts: set[str] = set()
+    for item in configured.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            parsed = urlsplit("//" + value)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"{AZURE_ALLOWED_HOSTS_ENV} contains an invalid host.") from exc
+        if (
+            not host
+            or port is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.netloc.lower() != value.lower()
+        ):
+            raise ValueError(
+                f"{AZURE_ALLOWED_HOSTS_ENV} must contain comma-separated hostnames without schemes or ports."
+            )
+        hosts.add(host.lower())
+    if not hosts:
+        raise ValueError(f"Set {AZURE_ALLOWED_HOSTS_ENV} to the exact Azure hostnames allowed to access the app.")
+    return hosts
+
+
+def _normalize_https_origin(origin: str) -> str:
+    try:
+        parsed = urlsplit(origin)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid allowed origin.") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not hostname
+        or parsed.username
+        or parsed.password
+        or port not in {None, 443}
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Azure allowed origins must be HTTPS origins without a path, query, or fragment.")
+    return f"https://{hostname.lower()}"
+
+
+def _azure_allowed_origins(allowed_hosts: set[str]) -> set[str]:
+    configured = os.environ.get(AZURE_ALLOWED_ORIGINS_ENV, "")
+    origins: set[str] = set()
+    for item in configured.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        origin = _normalize_https_origin(value)
+        if urlsplit(origin).hostname not in allowed_hosts:
+            raise ValueError(f"Every {AZURE_ALLOWED_ORIGINS_ENV} hostname must also be in {AZURE_ALLOWED_HOSTS_ENV}.")
+        origins.add(origin)
+    if not origins:
+        raise ValueError(f"Set {AZURE_ALLOWED_ORIGINS_ENV} to the exact HTTPS origins allowed to access the app.")
+    return origins
+
+
+def _server_address(default_port: int) -> tuple[str, int]:
+    if not os.environ.get("WEBSITE_INSTANCE_ID"):
+        return "127.0.0.1", default_port
+
+    allowed_hosts = _azure_allowed_hosts()
+    _azure_allowed_origins(allowed_hosts)
+    configured_port = os.environ.get("PORT") or os.environ.get("WEBSITES_PORT")
+    try:
+        port = int(configured_port) if configured_port else default_port
+    except ValueError as exc:
+        raise ValueError("PORT or WEBSITES_PORT must be a valid TCP port number.") from exc
+    if not 0 < port < 65536:
+        raise ValueError("PORT or WEBSITES_PORT must be between 1 and 65535.")
+    return "0.0.0.0", port
+
+
 class AnalyzerRequestHandler(BaseHTTPRequestHandler):
     def _session(self) -> tuple[dict[str, str] | None, str | None]:
         from http.cookies import SimpleCookie
@@ -885,15 +970,18 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         return user
 
     def _set_session_cookie(self, token: str | None, expires: str | None = None) -> None:
+        secure = "; Secure" if os.environ.get("WEBSITE_INSTANCE_ID") else ""
         if token is None:
-            self._response_cookie = f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+            self._response_cookie = (
+                f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}"
+            )
         else:
             from urllib.parse import quote
             from email.utils import format_datetime
 
             expiration = datetime.fromisoformat(expires or "").astimezone(timezone.utc)
             self._response_cookie = (
-                f"{SESSION_COOKIE}={quote(token)}; Path=/; HttpOnly; SameSite=Strict; "
+                f"{SESSION_COOKIE}={quote(token)}; Path=/; HttpOnly; SameSite=Strict{secure}; "
                 f"Max-Age={SESSION_TTL_HOURS * 60 * 60}; Expires={format_datetime(expiration, usegmt=True)}"
             )
 
@@ -936,17 +1024,56 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"logged_out": True})
 
     def _is_local_request(self) -> bool:
-        host = urlsplit("//" + self.headers.get("Host", "")).hostname
-        if host not in {"127.0.0.1", "localhost"}:
+        host_header = self.headers.get("Host", "")
+        try:
+            parsed_host = urlsplit("//" + host_header)
+            host = parsed_host.hostname
+            port = parsed_host.port
+        except ValueError:
             return False
+        if (
+            not host
+            or parsed_host.username
+            or parsed_host.password
+            or parsed_host.path
+            or parsed_host.query
+            or parsed_host.fragment
+        ):
+            return False
+
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).hostname not in {"127.0.0.1", "localhost"}:
+
+        if not os.environ.get("WEBSITE_INSTANCE_ID"):
+            if host not in {"127.0.0.1", "localhost"}:
+                return False
+            if origin:
+                try:
+                    origin_host = urlsplit(origin).hostname
+                except ValueError:
+                    return False
+                if origin_host not in {"127.0.0.1", "localhost"}:
+                    return False
+            return True
+
+        if port not in {None, 443}:
+            return False
+
+        try:
+            allowed_hosts = _azure_allowed_hosts()
+            allowed_origins = _azure_allowed_origins(allowed_hosts)
+            if host not in allowed_hosts:
+                return False
+            if self.command in {"POST", "PUT", "PATCH", "DELETE"} and not origin:
+                return False
+            if origin and _normalize_https_origin(origin) not in allowed_origins:
+                return False
+        except ValueError:
             return False
         return True
 
     def do_GET(self) -> None:
         if not self._is_local_request():
-            self._send_json(403, {"error": "Local browser access only."})
+            self._send_json(403, {"error": "This request host or origin is not allowed."})
             return
         path = urlsplit(self.path).path
         if path in {"/", "/login"}:
@@ -1047,7 +1174,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if not self._is_local_request():
-            self._send_json(403, {"error": "Local browser access only."})
+            self._send_json(403, {"error": "This request host or origin is not allowed."})
             return
         path = urlsplit(self.path).path
         if path == "/api/setup":
@@ -1271,7 +1398,7 @@ class AnalyzerRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         if not self._is_local_request():
-            self._send_json(403, {"error": "Local browser access only."})
+            self._send_json(403, {"error": "This request host or origin is not allowed."})
             return
         user = self._authorize(write=True)
         if user is None:
@@ -2636,9 +2763,16 @@ def main() -> None:
         )
         return
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), AnalyzerRequestHandler)
-    print(f"Phishing analyzer is available at http://127.0.0.1:{args.port}")
-    print("Local access only. Press Ctrl+C to stop.")
+    try:
+        bind_host, bind_port = _server_address(args.port)
+    except ValueError as exc:
+        parser.error(str(exc))
+    server = ThreadingHTTPServer((bind_host, bind_port), AnalyzerRequestHandler)
+    if bind_host == "127.0.0.1":
+        print(f"Phishing analyzer is available at http://127.0.0.1:{bind_port}")
+        print("Local access only. Press Ctrl+C to stop.")
+    else:
+        print(f"Phishing analyzer is listening on {bind_host}:{bind_port} behind Azure App Service.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

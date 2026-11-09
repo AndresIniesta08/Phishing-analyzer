@@ -32,6 +32,7 @@ from web_app import (
     _ocr_screenshot,
     _migrate_feedback_schema,
     _migrate_incident_schema,
+    _server_address,
     _spreadsheet_safe,
 )
 
@@ -93,6 +94,67 @@ class WebAppTests(unittest.TestCase):
         self.assertIn('id="history-status"', page)
         self.assertIn('id="whatsapp-pdf-link"', page)
         self.assertNotIn('id="auth-form"', page)
+
+    def test_azure_server_uses_assigned_port_and_requires_allowlists(self) -> None:
+        azure_environment = {
+            "WEBSITE_INSTANCE_ID": "test-instance",
+            "PORT": "8123",
+            "WEBSITES_PORT": "9000",
+            "PHISHING_ANALYZER_ALLOWED_HOSTS": "analyzer.azurewebsites.net",
+            "PHISHING_ANALYZER_ALLOWED_ORIGINS": "https://analyzer.azurewebsites.net",
+        }
+        with mock.patch.dict(os.environ, azure_environment):
+            self.assertEqual(_server_address(8765), ("0.0.0.0", 8123))
+
+        with mock.patch.dict(os.environ, {"WEBSITE_INSTANCE_ID": "test-instance"}, clear=False):
+            os.environ.pop("PHISHING_ANALYZER_ALLOWED_HOSTS", None)
+            os.environ.pop("PHISHING_ANALYZER_ALLOWED_ORIGINS", None)
+            with self.assertRaisesRegex(ValueError, "PHISHING_ANALYZER_ALLOWED_HOSTS"):
+                _server_address(8765)
+
+    def test_azure_requests_require_allowlisted_host_and_origin(self) -> None:
+        azure_environment = {
+            "WEBSITE_INSTANCE_ID": "test-instance",
+            "PHISHING_ANALYZER_ALLOWED_HOSTS": "analyzer.azurewebsites.net",
+            "PHISHING_ANALYZER_ALLOWED_ORIGINS": "https://analyzer.azurewebsites.net",
+        }
+        with mock.patch.dict(os.environ, azure_environment):
+            request = Request(
+                f"{self.base_url}/health",
+                headers={
+                    "Host": "analyzer.azurewebsites.net",
+                    "Origin": "https://analyzer.azurewebsites.net",
+                },
+            )
+            with _RAW_URLOPEN(request) as response:
+                self.assertEqual(response.status, 200)
+
+            request = Request(
+                f"{self.base_url}/health",
+                headers={
+                    "Host": "analyzer.azurewebsites.net",
+                    "Origin": "https://attacker.example",
+                },
+            )
+            with self.assertRaises(HTTPError) as rejected:
+                _RAW_URLOPEN(request)
+            self.assertEqual(rejected.exception.code, 403)
+
+            request = Request(
+                f"{self.base_url}/health",
+                headers={"Host": "localhost"},
+            )
+            with self.assertRaises(HTTPError) as rejected:
+                _RAW_URLOPEN(request)
+            self.assertEqual(rejected.exception.code, 403)
+
+    def test_azure_session_cookie_is_secure(self) -> None:
+        handler = object.__new__(AnalyzerRequestHandler)
+        with mock.patch.dict(os.environ, {"WEBSITE_INSTANCE_ID": "test-instance"}):
+            handler._set_session_cookie("session-token", "2026-11-09T12:00:00+00:00")
+            self.assertIn("; Secure;", handler._response_cookie)
+            handler._set_session_cookie(None)
+            self.assertIn("; Secure", handler._response_cookie)
 
     def test_signed_out_visitors_are_redirected_to_standalone_login(self) -> None:
         with _RAW_URLOPEN(f"{self.base_url}/") as response:

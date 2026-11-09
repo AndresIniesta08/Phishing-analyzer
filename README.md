@@ -1,9 +1,10 @@
 # Email Phishing Risk Analyzer
 
-A Python desktop app and local-only localhost web app. The web app parses pasted
-email or `.eml`/`.txt` files, previews extracted details,
-performs explainable offline heuristics, and saves metadata-only reports to a
-local SQLite history. It does not establish that a message is safe or malicious.
+A Python desktop app and local-first web app. By default, the web app binds only
+to localhost. It parses pasted email or `.eml`/`.txt` files, previews extracted
+details, performs explainable offline heuristics, and saves metadata-only
+reports to a local SQLite history. It does not establish that a message is safe
+or malicious.
 Scores are capped at `100`: `0–24` is LOW, `25–54` is SUSPICIOUS, and `55–100`
 is HIGH. The thresholds are heuristic, not a calibrated probability.
 
@@ -61,10 +62,35 @@ Management** in the application. The sign-in page does not offer registration,
 and account-creation API requests outside the administrator console are
 rejected.
 
-The server binds exclusively to `127.0.0.1`. It is not hosted on the public
-internet. Local accounts share this device's report history; the app does not
-provide tenant isolation. Do not expose it to a network or deploy it publicly
-as-is.
+By default, the server binds exclusively to `127.0.0.1`. Local accounts share
+the configured database and the app does not provide tenant isolation. Do not
+expose it to the public internet or deploy it publicly as-is.
+
+### Private Azure App Service
+
+Azure App Service is supported only for a privately restricted deployment. Keep
+App Service access restrictions or a private endpoint in place, require HTTPS,
+and do not enable public access. The app binds to `0.0.0.0` only when Azure sets
+`WEBSITE_INSTANCE_ID`; it uses `PORT`, then `WEBSITES_PORT`, then the `--port`
+argument.
+
+Configure these App Service application settings with the exact app hostname
+(and any custom hostname) and HTTPS origin:
+
+```text
+PHISHING_ANALYZER_ALLOWED_HOSTS=analyzer.example.azurewebsites.net
+PHISHING_ANALYZER_ALLOWED_ORIGINS=https://analyzer.example.azurewebsites.net
+```
+
+Comma-separate additional hostnames/origins. The app refuses to start in Azure
+without both allowlists, rejects requests with unlisted hosts/origins, requires
+an Origin on write requests, and marks session cookies Secure. Do not use
+wildcards. The initial administrator must be provisioned before sign-in.
+
+Reports and accounts are stored in SQLite. Set
+`PHISHING_ANALYZER_DATA_DIR` to persistent App Service storage and run a single
+app instance; this database is not designed for multiple scaled-out instances
+or tenant isolation. Back up the database using your approved process.
 
 ### Optional VirusTotal reputation lookup
 
