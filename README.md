@@ -74,14 +74,36 @@ and do not enable public access. The app binds to `0.0.0.0` only when Azure sets
 `WEBSITE_INSTANCE_ID`; it uses `PORT`, then `WEBSITES_PORT`, then the `--port`
 argument.
 
-Set the Linux App Service startup command to:
+Set the Linux App Service startup command to the absolute path:
 
 ```text
-python web_app.py --port 8000
+python /home/site/wwwroot/azure_startup.py
 ```
 
-Deploy the project root and install `requirements.txt` during the App Service
-build. The email analysis backend is pure Python; the optional Tkinter desktop
+This path assumes `azure_startup.py` is deployed directly in
+`/home/site/wwwroot`. If your ZIP preserves an enclosing repository directory,
+use that directory in the command, for example
+`python /home/site/wwwroot/Phishing-analyzer-main/azure_startup.py`.
+
+The launcher finds the application files relative to itself, including when
+the ZIP contains an enclosing project folder, validates the required files,
+then starts `web_app.py` from its actual directory. If you do not use the
+launcher, set the startup command to
+`cd /home/site/wwwroot/<application-folder> && python web_app.py --port 8000`,
+where `<application-folder>` is the directory containing `web_app.py`.
+
+The deployed application directory must contain `web_app.py`,
+`email_analysis.py`, `phishing_analyzer.py`, `requirements.txt`, and the full
+`web/` directory (`index.html`, `app.js`, `login.html`, `login.js`, and
+`styles.css`). Include `azure_startup.py` in the deployment package as well.
+When creating a deployment ZIP, include the project contents at the ZIP root,
+or preserve them together in one enclosing project directory and point the
+startup command to that directory's launcher. In App Service deployment
+settings, enable build automation (for ZIP deploy, set
+`SCM_DO_BUILD_DURING_DEPLOYMENT=true`) so the Python environment installs
+`requirements.txt`.
+
+The email analysis backend is pure Python; the optional Tkinter desktop
 interface is isolated in `desktop_app.py` and is not imported by the web app.
 No Tk or other desktop GUI packages are needed for this deployment. Pillow and
 pytesseract are in `requirements.txt`; screenshot OCR additionally requires the
