@@ -74,6 +74,20 @@ and do not enable public access. The app binds to `0.0.0.0` only when Azure sets
 `WEBSITE_INSTANCE_ID`; it uses `PORT`, then `WEBSITES_PORT`, then the `--port`
 argument.
 
+Set the Linux App Service startup command to:
+
+```text
+python web_app.py --port 8000
+```
+
+Deploy the project root and install `requirements.txt` during the App Service
+build. The email analysis backend is pure Python; the optional Tkinter desktop
+interface is isolated in `desktop_app.py` and is not imported by the web app.
+No Tk or other desktop GUI packages are needed for this deployment. Pillow and
+pytesseract are in `requirements.txt`; screenshot OCR additionally requires the
+Tesseract executable to be installed in the Linux environment. Other analysis
+features do not require Tesseract.
+
 Configure these App Service application settings with the exact app hostname
 (and any custom hostname) and HTTPS origin:
 

@@ -1,9 +1,23 @@
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 
 from phishing_analyzer import analyze_email
 
 
 class AnalyzeEmailTests(unittest.TestCase):
+    def test_web_backend_imports_without_tkinter(self) -> None:
+        script = "import sys; sys.modules['tkinter'] = None; import web_app"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            check=False,
+            cwd=Path(__file__).parent,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_ordinary_message_is_low_risk(self) -> None:
         result = analyze_email(
             "From: coworker@example.com\nSubject: Meeting notes\n\n"
