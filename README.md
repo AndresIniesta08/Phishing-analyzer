@@ -137,10 +137,11 @@ reports, while dashboard counters summarize all stored reports. Trend charts
 aggregate the local report history into UTC day/month buckets; they do not
 estimate risk probability or use external data.
 
-Individual PDF reports include a risk summary, message details, findings with
-supporting evidence and recommended responses, reported authentication results,
-extracted links, attachment hashes, and analysis limitations. They do not
-include email body content.
+Email, screenshot, and WhatsApp reports can be downloaded individually as PDFs.
+They include a risk summary, message details, findings with supporting evidence
+and recommended responses, reported authentication results, extracted links,
+attachment hashes, and analysis limitations. They do not include email body
+content.
 
 Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, not plaintext.
 Sessions expire after eight hours and use HttpOnly, SameSite cookies plus a

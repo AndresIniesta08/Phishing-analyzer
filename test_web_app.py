@@ -91,6 +91,7 @@ class WebAppTests(unittest.TestCase):
         self.assertIn('href="#threat-detections"', page)
         self.assertIn('id="email-drop-zone"', page)
         self.assertIn('id="history-status"', page)
+        self.assertIn('id="whatsapp-pdf-link"', page)
         self.assertNotIn('id="auth-form"', page)
 
     def test_signed_out_visitors_are_redirected_to_standalone_login(self) -> None:
@@ -1231,6 +1232,26 @@ class WebAppTests(unittest.TestCase):
         self.assertIn(b"Payroll verification", pdf)
         self.assertIn(b"finance@example.net", pdf)
         self.assertIn(b"micros0ft.com.example.net", pdf)
+        delete = Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")
+        with urlopen(delete):
+            pass
+
+    def test_whatsapp_report_can_be_downloaded_as_pdf(self) -> None:
+        request = Request(
+            f"{self.base_url}/api/whatsapp/analyze",
+            data=json.dumps({"message": "Please review this download."}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request) as response:
+            report_id = json.loads(response.read())["report_id"]
+        with urlopen(f"{self.base_url}/api/report/{report_id}/pdf") as response:
+            pdf = response.read()
+            self.assertEqual(response.headers.get_content_type(), "application/pdf")
+            self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
+        self.assertTrue(pdf.startswith(b"%PDF-1.4"))
+        self.assertIn(b"WhatsApp scam review", pdf)
+        self.assertIn(report_id.encode(), pdf)
         delete = Request(f"{self.base_url}/api/report/{report_id}", method="DELETE")
         with urlopen(delete):
             pass

@@ -79,6 +79,9 @@ function renderWhatsappReview(report) {
   document.querySelector("#whatsapp-risk-level").textContent = `${report.level} risk indicators`;
   document.querySelector("#whatsapp-risk-score").textContent = report.score;
   document.querySelector("#whatsapp-report-id").textContent = `Report ${report.report_id}`;
+  const pdfLink = document.querySelector("#whatsapp-pdf-link");
+  pdfLink.href = `/api/report/${encodeURIComponent(report.report_id)}/pdf`;
+  pdfLink.hidden = false;
   document.querySelector("#whatsapp-review-disclaimer").textContent =
     "A low score does not mean the message or ZIP is safe. This review does not scan file contents or replace antivirus tools.";
 
@@ -270,7 +273,7 @@ function renderCategories(data) {
 function renderResult(data) {
   currentReportId = data.report_id || data.id;
   const incidentButton = document.querySelector("#create-incident-button");
-  incidentButton.hidden = !["analyst", "admin"].includes(currentUser?.role);
+  incidentButton.hidden = !["analyst", "admin"].includes(currentUser && currentUser.role);
   incidentButton.disabled = incidentReportIds.has(currentReportId);
   incidentButton.textContent = incidentButton.disabled ? "Incident already created" : "Create incident";
   const level = String(data.level).toLowerCase();
@@ -294,13 +297,13 @@ function renderResult(data) {
   const feedback = data.feedback;
   const feedbackStatus = document.querySelector("#feedback-status");
   const feedbackNote = document.querySelector("#feedback-note");
-  document.querySelector("#feedback-classification").value = feedback?.classification || "confirmed_phishing";
+  document.querySelector("#feedback-classification").value = feedback && feedback.classification ? feedback.classification : "confirmed_phishing";
   document.querySelector("#submit-feedback-button").disabled = !currentReportId;
   feedbackStatus.textContent = feedback
     ? `${feedback.classification.replaceAll("_", " ")} · reviewed by ${feedback.submitted_by || "analyst"} on ${feedback.submitted_at}${feedback.note ? ` — ${feedback.note}` : ""}${data.feedback_review ? ` · admin ${data.feedback_review.decision} the review` : " · awaiting administrator review"}`
     : "Analysts can record a classification and reason. Feedback waits for administrator review and does not automatically tune rules.";
   feedbackStatus.classList.toggle("feedback-confirmed", Boolean(feedback));
-  feedbackNote.value = feedback?.note || "";
+  feedbackNote.value = feedback && feedback.note ? feedback.note : "";
   const pdfLink = document.querySelector("#pdf-link");
   pdfLink.href = `/api/report/${encodeURIComponent(currentReportId)}/pdf`;
   pdfLink.hidden = false;
@@ -322,18 +325,18 @@ function renderResult(data) {
   for (const url of data.urls) {
     const item = document.createElement("li");
     const result = url.virustotal;
-    const domainReport = result?.domain_report;
-    const detectionStats = result?.analysis_stats;
+    const domainReport = result && result.domain_report;
+    const detectionStats = result && result.analysis_stats;
     const summary = [
       `Domain: ${url.host}`,
-      `VirusTotal: ${result?.reputation || "not checked"}`,
-      result ? `detections: ${result.detection_count ?? "not available"}` : "",
+      `VirusTotal: ${(result && result.reputation) || "not checked"}`,
+      result ? `detections: ${(result.detection_count !== null && result.detection_count !== undefined) ? result.detection_count : "not available"}` : "",
       detectionStats ? `engines: ${JSON.stringify(detectionStats)}` : "",
       domainReport ? `domain reputation: ${domainReport.reputation}` : "",
-      result?.last_final_url ? `reported final URL: ${result.last_final_url}` : "",
-      result?.redirect_chain?.length ? `reported redirects: ${result.redirect_chain.join(" → ")}` : "",
-      result?.last_http_response_code ? `HTTP status: ${result.last_http_response_code}` : "",
-      result?.categories && Object.keys(result.categories).length
+      result && result.last_final_url ? `reported final URL: ${result.last_final_url}` : "",
+      result && result.redirect_chain && result.redirect_chain.length ? `reported redirects: ${result.redirect_chain.join(" → ")}` : "",
+      result && result.last_http_response_code ? `HTTP status: ${result.last_http_response_code}` : "",
+      result && result.categories && Object.keys(result.categories).length
         ? `categories: ${Object.entries(result.categories).map(([source, category]) => `${source}: ${category}`).join(", ")}`
         : "",
     ].filter(Boolean);
@@ -560,7 +563,7 @@ async function loadHistory() {
       row.append(scoreCell);
       const statusCell = document.createElement("td");
       statusCell.textContent = report.status === "none" ? "—" : report.status;
-      statusCell.hidden = !["analyst", "admin"].includes(currentUser?.role);
+      statusCell.hidden = !["analyst", "admin"].includes(currentUser && currentUser.role);
       row.append(statusCell);
       const feedbackCell = document.createElement("td");
       feedbackCell.textContent = report.feedback ? report.feedback.replace("_", " ") : "—";
@@ -577,7 +580,7 @@ async function loadHistory() {
       remove.dataset.deleteReport = report.id;
       remove.textContent = "Delete";
       actions.append(view);
-      if (currentUser?.role === "admin") {
+      if (currentUser && currentUser.role === "admin") {
         actions.append(document.createTextNode(" "), remove);
       }
       row.append(actions);
@@ -616,7 +619,7 @@ async function renderThreatDetections() {
     row.append(riskCell);
     const reputationCell = document.createElement("td");
     reputationCell.textContent = detection.virustotal
-      ? `${detection.virustotal.reputation} · ${detection.virustotal.detection_count ?? "?"} detections`
+      ? `${detection.virustotal.reputation} · ${(detection.virustotal.detection_count !== null && detection.virustotal.detection_count !== undefined) ? detection.virustotal.detection_count : "?"} detections`
       : "Not checked";
     row.append(reputationCell);
     for (const value of [detection.subject, detection.analyzed_at]) {
@@ -1050,7 +1053,7 @@ document.querySelector("#settings-form").addEventListener("submit", async (event
 document.querySelector("#users-rows").addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLButtonElement)) return;
-  const userId = target.closest("tr")?.dataset.userId;
+  const row = target.closest("tr"); const userId = row ? row.dataset.userId : undefined;
   if (!userId) return;
   clearError();
   try {
@@ -1118,7 +1121,7 @@ document.querySelector("#alerts-list").addEventListener("click", async (event) =
       body: JSON.stringify({ alert_id: target.dataset.ackAlert }),
     });
     await loadAlerts();
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (error) {
     showError(error instanceof Error ? error.message : "Could not acknowledge this alert.");
   }
@@ -1141,7 +1144,7 @@ document.querySelector("#incidents-list").addEventListener("click", async (event
       }),
     });
     await loadIncidents();
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (error) {
     showError(error instanceof Error ? error.message : "Could not update the incident.");
   }
@@ -1162,7 +1165,7 @@ document.querySelector("#create-incident-button").addEventListener("click", asyn
     await loadIncidents();
     document.querySelector("#create-incident-button").disabled = true;
     document.querySelector("#create-incident-button").textContent = "Incident already created";
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (error) {
     showError(error instanceof Error ? error.message : "Could not create an incident.");
   }
@@ -1248,7 +1251,7 @@ document.querySelector("#submit-feedback-button").addEventListener("click", asyn
       `Recorded ${feedback.classification.replaceAll("_", " ")} by analyst on ${feedback.submitted_at}. Awaiting administrator review.`;
     document.querySelector("#feedback-status").classList.add("feedback-confirmed");
     await loadHistory();
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (error) {
     showError(error instanceof Error ? error.message : "Could not save analyst feedback.");
   } finally {
@@ -1280,8 +1283,8 @@ analyzeButton.addEventListener("click", async () => {
     renderResult(result);
     await loadHistory();
     await loadAlerts();
-    if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (["analyst", "admin"].includes(currentUser && currentUser.role)) await loadIncidents();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (error) {
     showError(error instanceof Error ? error.message : "The analyzer could not be reached.");
   } finally {
@@ -1336,7 +1339,7 @@ async function loadEmailFile(file) {
 }
 
 fileInput.addEventListener("change", () => {
-  void loadEmailFile(fileInput.files?.[0]);
+  void loadEmailFile(fileInput.files && fileInput.files[0]);
 });
 
 const inputCard = document.querySelector(".input-card");
@@ -1353,7 +1356,7 @@ for (const eventName of ["dragleave", "drop"]) {
   });
 }
 inputCard.addEventListener("drop", (event) => {
-  const file = event.dataTransfer?.files?.[0];
+  const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
   if (file) void loadEmailFile(file);
 });
 
@@ -1368,8 +1371,8 @@ document.querySelector("#history-rows").addEventListener("click", async (event) 
       await requestJson(`/api/report/${encodeURIComponent(target.dataset.deleteReport)}`, { method: "DELETE" });
       await loadHistory();
       await loadAlerts();
-      if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
-      if (currentUser?.role === "admin") await loadAdmin();
+      if (["analyst", "admin"].includes(currentUser && currentUser.role)) await loadIncidents();
+      if (currentUser && currentUser.role === "admin") await loadAdmin();
       if (document.querySelector("#report-date").textContent.includes(target.dataset.deleteReport)) {
         resultCard.hidden = true;
         currentReportId = null;
@@ -1399,7 +1402,7 @@ document.querySelector("#clear-button").addEventListener("click", () => {
 whatsappZipInput.addEventListener("change", () => {
   const error = document.querySelector("#whatsapp-review-error");
   error.hidden = true;
-  const file = whatsappZipInput.files?.[0];
+  const file = whatsappZipInput.files && whatsappZipInput.files[0];
   if (!file) {
     document.querySelector("#whatsapp-zip-name").textContent = "No ZIP selected.";
     return;
@@ -1442,7 +1445,7 @@ whatsappReviewForm.addEventListener("submit", async (event) => {
   button.disabled = true;
   button.textContent = "Reviewing safely…";
   try {
-    const zipFile = whatsappZipInput.files?.[0];
+    const zipFile = whatsappZipInput.files && whatsappZipInput.files[0];
     const payload = { message, zip_filename: "", zip_base64: "" };
     if (zipFile) {
       payload.zip_filename = zipFile.name;
@@ -1486,7 +1489,7 @@ screenshotFileInput.addEventListener("change", () => {
   screenshotOcrText.value = "";
   screenshotFilename = "";
   resetScreenshotPreview();
-  const file = screenshotFileInput.files?.[0];
+  const file = screenshotFileInput.files && screenshotFileInput.files[0];
   if (!file) {
     document.querySelector("#screenshot-file-name").textContent = "No screenshot selected.";
     document.querySelector("#screenshot-ocr-button").disabled = true;
@@ -1524,7 +1527,7 @@ document.querySelector("#screenshot-ocr-form").addEventListener("submit", async 
   event.preventDefault();
   const error = document.querySelector("#screenshot-ocr-error");
   error.hidden = true;
-  const file = screenshotFileInput.files?.[0];
+  const file = screenshotFileInput.files && screenshotFileInput.files[0];
   if (!file) {
     error.textContent = "Choose a screenshot before extracting text.";
     error.hidden = false;
@@ -1586,8 +1589,8 @@ document.querySelector("#screenshot-analyze-button").addEventListener("click", a
     renderResult(report);
     await loadHistory();
     await loadAlerts();
-    if (["analyst", "admin"].includes(currentUser?.role)) await loadIncidents();
-    if (currentUser?.role === "admin") await loadAdmin();
+    if (["analyst", "admin"].includes(currentUser && currentUser.role)) await loadIncidents();
+    if (currentUser && currentUser.role === "admin") await loadAdmin();
   } catch (analysisError) {
     error.textContent = analysisError instanceof Error ? analysisError.message : "Could not analyze the reviewed screenshot text.";
     error.hidden = false;
